@@ -295,7 +295,10 @@ def run() -> int:
 
     # --- BLIND_EDIT
     add("BLIND_EDIT dirty", len(incidents.detect_blind_edits([_call(t0, "Edit", path="a.py")])) == 1)
-    add("BLIND_EDIT clean after real read", len(incidents.detect_blind_edits([_call(t0, "Read", path="A.PY", out_bytes=500), _call(t0, "Edit", path="a.py")])) == 0)
+    add("BLIND_EDIT clean after real read", len(incidents.detect_blind_edits([_call(t0, "Read", path="a.py", out_bytes=500), _call(t0, "Edit", path="a.py")])) == 0)
+    # Path case folds only where the filesystem convention does (os.path.normcase): Windows yes, POSIX no.
+    case_blind = 0 if os.name == "nt" else 1
+    add("BLIND_EDIT path case follows the platform", len(incidents.detect_blind_edits([_call(t0, "Read", path="A.PY", out_bytes=500), _call(t0, "Edit", path="a.py")])) == case_blind)
     add("BLIND_EDIT tiny read does not count", len(incidents.detect_blind_edits([_call(t0, "Read", path="a.py", out_bytes=40), _call(t0, "Edit", path="a.py")])) == 1)
     add("BLIND_EDIT write-new clean", len(incidents.detect_blind_edits([_call(t0, "Write", path="new.py"), _call(t0, "Edit", path="new.py")])) == 0)
     add("BLIND_EDIT auto-loaded excluded", len(incidents.detect_blind_edits([_call(t0, "Edit", path="C:/x/CLAUDE.md")])) == 0)
