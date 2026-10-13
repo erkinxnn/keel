@@ -1,0 +1,114 @@
+# -*- coding: utf-8 -*-
+"""PostToolUse: write a tool.call, run the detectors, and on a new incident tell the agent in one
+line through additionalContext. Advises, does not block.
+
+Input: {"session_id","cwd","hook_event_name":"PostToolUse","tool_name","tool_input","tool_response","tool_use_id"?}
+Output (only on an incident): {"hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"..."}}
+The field ruler (out_bytes, ok, in_bytes) is shared with backfill: keel.extract. `out_bytes` is
+what the result adds to the MODEL'S context (edit payloads and images are normalised there).
+
+Note: Claude Code fires PostToolUse only for tool calls that SUCCEED. Failed calls go to a
+separate PostToolUseFailure event, which this adapter does not handle yet (see docs/ARCHITECTURE.md).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _common import agent_label, emit, known_classes, ledger_for, locked_state, project_name, remember_classes, run_hook, schema  # noqa: E402
+
+from keel import incidents  # noqa: E402
+from keel.extract import in_bytes, is_error, norm_path, tool_path, tool_result_len  # noqa: E402
+
+WINDOW = 12
+FANOUT_BUCKET_S = 15
+
+
+def main(inp):
+    cwd = inp.get("cwd")
+    session = str(inp.get("session_id") or "nosession")
+    tool = str(inp.get("tool_name") or "?")
+    tin = inp.get("tool_input") or {}
+    resp = inp.get("tool_response")
+    sig = incidents.signature(tool, tin)
+    key = str(inp.get("tool_use_id") or sig)
+    now = time.time()
+    led = ledger_for(cwd)
+    project = project_name(cwd)
+    out_bytes = tool_result_len(tool, resp)
+    ok = not is_error(resp)
+    fresh = []
+    agent = agent_label(inp)
+    with locked_state(cwd, session) as st:
+        pend = st.setdefault("pending", {})
+        call = pend.pop(key, None)
+        if call is None:
+            # without PreToolUse the duration is counted from the previous event of the session:
+            # for a stall (a pause over 30 minutes) that is enough, the exact call duration is not needed
+            prev_t = float(st.get("last_t") or now)
+            call = {"t": prev_t, "tool": tool, "sig": sig, "path": tool_path(tin), "in_bytes": in_bytes(tin),
+                    "turn": int(st.get("turn") or 0),
+                    "msg": f"{int(st.get('turn') or 0)}:{int(now // FANOUT_BUCKET_S)}", "approx": True}
+        st["last_t"] = now
+        ms = int((now - float(call["t"])) * 1000)
+        data = {"tool": tool, "ok": ok, "ms": max(ms, 0), "in_bytes": call["in_bytes"], "out_bytes": out_bytes,
+                "sig": sig, "path": call.get("path"), "turn": call.get("turn"), "msg": call.get("msg")}
+        if call.get("approx"):
+            data["ms_approx"] = True
+        ev = emit(schema.make_event("tool.call", session=session, project=project, agent=agent, src="hook", data=data))
+
+        # read and written paths for the blind-edit detector
+        reads = st.setdefault("read_paths", [])
+        p = call.get("path")
+        if p and tool in ("Read", "NotebookRead") and out_bytes >= incidents.MIN_READ_CHARS:
+            np_ = norm_path(p)
+            if np_ not in reads:
+                reads.append(np_)
+        if p and tool == "Write":
+            np_ = norm_path(p)
+            if np_ not in reads:
+                reads.append(np_)
+        del reads[:-500]
+
+        recent = st.setdefault("recent", [])
+        recent.append({"ev": "tool.call", "ts": ev["ts"], "session": session, "project": project, "agent": agent,
+                       "src": "hook", "data": ev["data"]})
+        del recent[:-WINDOW]
+        synthetic = [{"ev": "tool.call", "ts": ev["ts"], "session": session, "project": project, "agent": "head",
+                      "src": "hook", "data": {"tool": "Read", "path": rp, "sig": "", "ok": True, "out_bytes": incidents.MIN_READ_CHARS}}
+                     for rp in reads]
+        found = []
+        for det in (incidents.detect_loops, incidents.detect_floods, incidents.detect_stalls,
+                    incidents.detect_error_bursts, incidents.detect_fanout):
+            found.extend(det(recent))
+        found.extend(incidents.detect_blind_edits(synthetic + recent[-1:]))
+
+        said = st.setdefault("said", [])
+        hist = known_classes(cwd, led) if found else set()
+        for f in found:
+            k = f["data"]["cls"] + ":" + json.dumps(f["data"]["detail"], ensure_ascii=False, sort_keys=True)
+            if k in said:
+                continue
+            said.append(k)
+            f["data"]["repeat"] = f["data"]["cls"] in hist
+            emit(f)
+            fresh.append(f)
+            hist.add(f["data"]["cls"])
+        del said[:-300]
+    if fresh:
+        remember_classes(cwd, {f["data"]["cls"] for f in fresh})
+    if not fresh:
+        return None
+    msgs = []
+    for f in fresh:
+        c = incidents.CLASSES[f["data"]["cls"]]
+        rep = " REPEAT of a known class." if f["data"]["repeat"] else ""
+        msgs.append(f"KEEL {f['data']['cls']} ({c['name']}): {json.dumps(f['data']['detail'], ensure_ascii=False)}.{rep}")
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "\n".join(msgs)}}
+
+
+if __name__ == "__main__":
+    sys.exit(run_hook("post_tool_use", main))

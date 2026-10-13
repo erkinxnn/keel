@@ -1,0 +1,133 @@
+{
+  "_about": "Registry of agent incident classes. Field detect: how the class is recognised by the machine from the event ledger (auto), from the ledger plus an open contract (auto_with_contract), or only by hand (manual). Field rationale: why the class exists, i.e. the failure mode it was seeded from. The classes were seeded from failure modes observed over weeks of real Claude Code use by one operator; they are a starting vocabulary, not a benchmark.",
+  "classes": {
+    "LOOP": {
+      "name": "Retry loop",
+      "definition": "The same tool call (same signature) three or more times in a row within a window of ten calls, including a repeat of a failing command, or four or more times without failures.",
+      "severity": "medium",
+      "detect": "auto",
+      "rationale": "Observed: dozens of rounds of edits and reruns on the wrong axis, each producing no new knowledge.",
+      "cost_hint": "turns and tokens without new knowledge"
+    },
+    "BLIND_EDIT": {
+      "name": "Blind edit",
+      "definition": "An Edit of a file that was not read once in this session before the edit.",
+      "severity": "medium",
+      "detect": "auto",
+      "rationale": "Observed: editing one file while another one actually runs; overwriting a parallel session's changes; edits that bypass the harness read-before-edit rule through shell appends.",
+      "cost_hint": "overwritten changes, the wrong file edited"
+    },
+    "FLOOD": {
+      "name": "Context flood",
+      "definition": "The result of a single tool call longer than 20,000 chars entered the context whole.",
+      "severity": "low",
+      "detect": "auto",
+      "rationale": "Observed: files of hundreds of KB read whole, filling most of the window and degrading later answers.",
+      "cost_hint": "context window and cache; the model gets dumber as the window fills"
+    },
+    "STALL": {
+      "name": "Idle waiting",
+      "definition": "More than 30 minutes passed between a tool call and its result (waiting for a permission prompt or a hung process).",
+      "severity": "high",
+      "detect": "auto",
+      "rationale": "Observed: a session sat for 11 hours on a permission prompt nobody answered.",
+      "cost_hint": "calendar hours at zero spend"
+    },
+    "TOOL_ERROR_BURST": {
+      "name": "Tool error burst",
+      "definition": "Three or more erroneous tool results in a row.",
+      "severity": "medium",
+      "detect": "auto",
+      "rationale": "Observed: false blocks by guard hooks made the model try workarounds instead of the task.",
+      "cost_hint": "turns spent on workarounds"
+    },
+    "FANOUT": {
+      "name": "Subagent fan-out",
+      "definition": "Four or more Agent calls in a single model message without a stated reason.",
+      "severity": "high",
+      "detect": "auto",
+      "rationale": "Observed: several waves of parallel subagents burned the plan limits, and subagent spend was invisible to naive cost probes.",
+      "cost_hint": "plan limits, invisible spend"
+    },
+    "UNVERIFIED_CLAIM": {
+      "name": "Done without evidence",
+      "definition": "Completion words in the final text of a turn (done, finished, fixed, verified, sent, pass) with zero tool calls in that turn.",
+      "severity": "high",
+      "detect": "auto",
+      "rationale": "Observed: green reports on empty results; a 'sent' claim not backed by any outgoing log.",
+      "cost_hint": "the owner's trust, repeated work"
+    },
+    "REPEAT_ORDER": {
+      "name": "Owner repeats an order",
+      "definition": "The owner's message repeats an instruction already given (identical normalised text or 80 % word overlap with a message from the past 14 days).",
+      "severity": "high",
+      "detect": "auto",
+      "rationale": "Observed: a large share of one owner's messages were repeated orders, i.e. the first one was not carried out or not recorded durably.",
+      "cost_hint": "the owner's attention, the most expensive resource in the system"
+    },
+    "SCOPE_CREEP": {
+      "name": "Scope creep",
+      "definition": "An edit to a file outside the zone declared in the task contract.",
+      "severity": "medium",
+      "detect": "auto_with_contract",
+      "rationale": "Observed: agents touching files of other work streams, overwriting others' work and making review impossible.",
+      "cost_hint": "someone else's work overwritten, review impossible"
+    },
+    "BUDGET_OVERRUN": {
+      "name": "Overrun without checkpoint",
+      "definition": "The task's spend exceeded the contract budget with no task.checkpoint event before the overrun.",
+      "severity": "high",
+      "detect": "auto_with_contract",
+      "rationale": "Observed: token crises caused by runs with no ceiling; a budget ceiling should end in BLOCKED, not in an endless loop.",
+      "cost_hint": "limits and money"
+    },
+    "DEAD_BARRIER": {
+      "name": "Barrier died silently",
+      "definition": "A registered hook or gauge stopped firing, and the thing that noticed was not a liveness check.",
+      "severity": "high",
+      "detect": "manual",
+      "rationale": "Observed: most of a set of registered hooks stayed dead for weeks after a configuration edit.",
+      "cost_hint": "every rule the barrier was holding"
+    },
+    "RULE_WITHOUT_BARRIER": {
+      "name": "Rule without a barrier",
+      "definition": "A new rule is written as text with no trigger point in code.",
+      "severity": "medium",
+      "detect": "manual",
+      "rationale": "Observed: rules kept only as prose were broken every time.",
+      "cost_hint": "a future incident"
+    },
+    "META_INSTEAD_OF_PRODUCT": {
+      "name": "Meta instead of product",
+      "definition": "An incident was answered with a new document, gauge or rule rather than a change to the product.",
+      "severity": "high",
+      "detect": "manual",
+      "rationale": "Observed: dozens of files of text produced per single shown artifact.",
+      "cost_hint": "zero output at full activity"
+    },
+    "MEMORY_LOST": {
+      "name": "Project memory not attached",
+      "definition": "The session was launched from a directory that has no project memory attached, and worked blind.",
+      "severity": "high",
+      "detect": "auto",
+      "rationale": "Observed: sessions started from the wrong directory redid finished work and reversed settled decisions.",
+      "cost_hint": "redoing finished work and already cancelled decisions"
+    },
+    "MEASURING_BECAME_COST": {
+      "name": "Measurement became the cost",
+      "definition": "The control instrument costs more than it saves: hook latency, injections into context, cold starts.",
+      "severity": "medium",
+      "detect": "auto",
+      "rationale": "Observed: guard hooks spawning several processes per Write, and a quota guard that spent minutes per day in dead waiting.",
+      "cost_hint": "minutes and tokens on every turn"
+    },
+    "FALSE_BLOCK": {
+      "name": "False barrier block",
+      "definition": "A barrier stopped a legitimate action; the agent spends turns on workarounds or gives up.",
+      "severity": "medium",
+      "detect": "manual",
+      "rationale": "Observed: a large fraction of blocks from one set of guards were undeniably false or left no alternative.",
+      "cost_hint": "turns, workarounds, side roads"
+    }
+  }
+}

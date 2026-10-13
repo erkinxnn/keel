@@ -1,0 +1,28 @@
+{
+  "_about": "Registration of the KEEL adapters in a PROJECT .claude/settings.json (not the global one: global hooks hit every project). Use `python tools/install_hooks.py --project <path>` to write this for you with absolute paths, or copy by hand and replace /ABSOLUTE/PATH/TO/keel with the folder you cloned. Use `python`, not `pythonw`, and always `-S -E`: site packages are not needed by the layer, and processing them costs 67-104 ms on every call (measured on one machine). The `*` matcher for Pre/PostToolUse makes the live ledger and the history ledger measure the same way. PreToolUse is optional (the installer does not register it, to save one process per call).",
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "python -S -E \"/ABSOLUTE/PATH/TO/keel/keel/hooks/session_start.py\"", "timeout": 10, "statusMessage": "KEEL: session scoreboard"}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "python -S -E \"/ABSOLUTE/PATH/TO/keel/keel/hooks/user_prompt_submit.py\"", "timeout": 5, "statusMessage": "KEEL: order"}]}
+    ],
+    "PreToolUse": [
+      {"matcher": "*",
+       "hooks": [{"type": "command", "command": "python -S -E \"/ABSOLUTE/PATH/TO/keel/keel/hooks/pre_tool_use.py\"", "timeout": 5}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "*",
+       "hooks": [{"type": "command", "command": "python -S -E \"/ABSOLUTE/PATH/TO/keel/keel/hooks/post_tool_use.py\"", "timeout": 5, "statusMessage": "KEEL: ledger"}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command", "command": "python -S -E \"/ABSOLUTE/PATH/TO/keel/keel/hooks/subagent_stop.py\"", "timeout": 15, "statusMessage": "KEEL: subagent to ledger"}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "python -S -E \"/ABSOLUTE/PATH/TO/keel/keel/hooks/stop.py\"", "timeout": 15, "statusMessage": "KEEL: evidence on done"}]}
+    ],
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "python -S -E \"/ABSOLUTE/PATH/TO/keel/keel/hooks/session_end.py\"", "timeout": 5}]}
+    ]
+  }
+}

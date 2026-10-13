@@ -1,0 +1,97 @@
+{
+ "_about": "Bands of the vital signs. Every band must carry a source: where the threshold comes from. A band without a source, or with status reference, has no right to paint a vital red: it is printed as a reference. inclusive=true means that equality with the threshold is already outside the band (V14: a Brier score of exactly 0.25 is a coin flip). IMPORTANT: all numeric thresholds were calibrated on the history of ONE user; treat them as starting points and recalibrate on your own ledger.",
+ "bands": {
+  "V1_accepted": {
+   "direction": "higher",
+   "warn_below": 1,
+   "source": "at least one deliverable accepted by the owner per window (a north-star counter); only trusted verdict sources count (tg, owner, owner-file)",
+   "status": "norm"
+  },
+  "V2_verified_done": {
+   "direction": "higher",
+   "warn_below": 0.8,
+   "source": "no norm established; reference only; verified counts only when verify is ok for every predicate under the contract hash",
+   "status": "reference"
+  },
+  "V3_evidence_ratio": {
+   "direction": "higher",
+   "warn_below": 0.8,
+   "source": "principle: a claim without evidence is not a claim; the threshold is reference until both ends are measured",
+   "status": "reference"
+  },
+  "V4_tokens_per_hour": {
+   "direction": "lower",
+   "warn_above": null,
+   "source": "no norm established; the baseline from your own history (median and p90) is printed instead",
+   "status": "reference"
+  },
+  "V5_flood_share": {
+   "direction": "lower",
+   "warn_above": 0.5,
+   "source": "one user's audit: oversized results filled most of the context window; the threshold is reference, awaiting measurement at both ends",
+   "status": "reference"
+  },
+  "V6_tool_error_rate": {
+   "direction": "lower",
+   "warn_above": null,
+   "source": "no norm established; baseline from your own history",
+   "status": "reference"
+  },
+  "V7_loops_per_100": {
+   "direction": "lower",
+   "warn_above": null,
+   "source": "no norm established; baseline from your own history",
+   "status": "reference"
+  },
+  "V8_blind_edit_rate": {
+   "direction": "lower",
+   "warn_above": 0.0,
+   "source": "Claude Code's own rule: Edit without a prior Read is refused; any blind edit is a defect; the denominator is distinct edited files",
+   "status": "norm"
+  },
+  "V9_stall_minutes": {
+   "direction": "lower",
+   "warn_above": 0,
+   "source": "a session that gets no permission within 30 minutes should mark the step and move on; the value is the union of waits over 30 min, any such wait is a WARN",
+   "status": "norm"
+  },
+  "V10_fanout_turns": {
+   "direction": "lower",
+   "warn_above": 0,
+   "source": "observed on one account: waves of parallel subagents burned the plan limits; a fan-out (4+ Agent calls in one model message) without a stated reason is an incident",
+   "status": "norm"
+  },
+  "V11_owner_repeat_share": {
+   "direction": "lower",
+   "warn_above": 0.05,
+   "source": "one operator measured about 19 % of their messages as repeated orders and called that a disease; 5 % is a reference target until the healthy end is measured",
+   "status": "reference"
+  },
+  "V12_repeat_incident_share": {
+   "direction": "lower",
+   "warn_above": 0.2,
+   "source": "principle: a repeat of a defect class is a stop line; the 0.2 threshold is reference",
+   "status": "reference"
+  },
+  "V13_layer_tax_ms": {
+   "direction": "lower",
+   "warn_above": 500,
+   "source": "one user's audit: six processes of 110-155 ms on every Write; a 500 ms per-call threshold is reference",
+   "status": "reference"
+  },
+  "V14_calibration_brier": {
+   "direction": "lower",
+   "warn_above": 0.25,
+   "inclusive": true,
+   "min_n": 8,
+   "source": "the size of a calibration shift is demonstrable from about 8 points (a permutation test on one history); a Brier score of 0.25 is a coin flip, equality is already outside the band; a share of p in 0.45..0.55 of 50 % or more means NO DATA",
+   "status": "norm"
+  }
+ },
+ "V13_layer_tax_ms": {
+  "direction": "lower",
+  "warn_above": 50,
+  "source": "benchmark on one machine: the adapter's own work is 25-47 ms, of which detectors are 0.03 ms and the rest is locking and the ledger fsync. The full call is measured separately: a 250 ms median threshold on a machine whose empty `python -S -E` process costs 87 ms; a 100 ms target is unreachable because the interpreter costs 70 ms and `import json` another 40 ms. Two numbers instead of one.",
+  "status": "reference"
+ }
+}

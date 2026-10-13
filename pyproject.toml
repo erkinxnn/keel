@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keel-ledger"
+version = "0.1.0"
+description = "A tamper-evident event ledger and vital signs for Claude Code sessions, built on hooks. Your agent says 'done'; KEEL records what actually happened."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "erkinxnn" }]
+keywords = ["claude-code", "hooks", "agents", "observability", "ledger", "llm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+keel = "keel.__main__:main"
+
+[tool.setuptools]
+packages = ["keel", "keel.hooks"]
+
+[tool.setuptools.package-data]
+keel = ["incident_classes.json", "vitals_bands.json"]
+"keel.hooks" = ["settings.snippet.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
