@@ -185,13 +185,28 @@ class Ledger:
         return n
 
     def _write_bytes(self, data: bytes) -> None:
+        """Append `data` completely or raise. A short write is continued until every byte is in; a
+        zero-byte write and any fsync error raise (nothing is swallowed on the append path), so a caller
+        that marks something as written does it only after this returns. If the write fails part-way,
+        the partial line is terminated (best effort) so the next append starts on a fresh line."""
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | _O_BINARY, 0o644)
+        written = 0
         try:
-            os.write(fd, data)
             try:
+                view = memoryview(data)
+                while written < len(data):
+                    n = os.write(fd, view[written:])
+                    if n <= 0:
+                        raise OSError("ledger write accepted 0 bytes")
+                    written += n
                 os.fsync(fd)
-            except OSError:
-                pass
+            except BaseException:
+                if 0 < written < len(data) and data[written - 1:written] != b"\n":
+                    try:
+                        os.write(fd, b"\n")
+                    except OSError:
+                        pass
+                raise
         finally:
             os.close(fd)
 

@@ -18,7 +18,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import emit, known_classes, ledger_for, locked_state, log, project_name, remember_classes, run_hook, schema  # noqa: E402
+from _common import emit, flush_call, known_classes, ledger_for, locked_state, log, project_name, remember_classes, run_hook, schema  # noqa: E402
 
 from keel import incidents  # noqa: E402
 from keel._fast import sha256_hex  # noqa: E402
@@ -64,9 +64,12 @@ def main(inp):
     evidence = 0
     final_text: list[str] = []
     final_req = None
+    out: dict | None = None
+    found: list = []
     with locked_state(cwd, session) as st:
         seen = list(st.get("seen_req", []))
         seen_set = set(seen)
+        new_seen: list[str] = []
         for rec in turn:
             msg = rec.get("message") or {}
             content = msg.get("content")
@@ -75,7 +78,7 @@ def main(inp):
                 usage = msg.get("usage")
                 if usage and req and req not in seen_set:
                     seen_set.add(req)
-                    seen.append(req)
+                    new_seen.append(req)
                     det = usage.get("output_tokens_details") or {}
                     emit(schema.make_event("usage", session=session, project=project, src="hook", ts=rec.get("timestamp"),
                                            data={"model": msg.get("model"), "input": schema.safe_int(usage.get("input_tokens")),
@@ -100,38 +103,42 @@ def main(inp):
                     for b in content:
                         if isinstance(b, dict) and b.get("type") == "tool_result" and not b.get("is_error"):
                             evidence += 1
-        st["seen_req"] = seen[-5000:]
         lam = inp.get("last_assistant_message")
         text = lam if isinstance(lam, str) and lam.strip() else "\n".join(final_text)
         words, negated = incidents.claim_scan(text)
-        if not words and not negated:
-            return None
-        claim = schema.make_event("claim", session=session, project=project, src="hook",
-                                  data={"kind": "done" if words else "negated", "words": sorted(set(words))[:6], "negated_n": negated,
-                                        "evidence_n": evidence, "tool_calls_in_turn": calls, "turn": int(st.get("turn") or 0),
-                                        "text_hash": sha256_hex(text.encode("utf-8", "replace"))[:12], "chars": len(text)})
-        emit(claim)
-        found = incidents.detect_unverified_claims([claim])
-        if not found:
-            return None
-        hist = known_classes(cwd, led)
-        for f in found:
-            f["data"]["repeat"] = "UNVERIFIED_CLAIM" in hist
-            emit(f)
-        remember_classes(cwd, {"UNVERIFIED_CLAIM"})
         blocks = int(st.get("stop_blocks_turn") or 0)
-        strict = os.environ.get("KEEL_STRICT") == "1" and blocks < 1 and not inp.get("stop_hook_active")
+        strict = False
+        if words or negated:
+            claim = schema.make_event("claim", session=session, project=project, src="hook",
+                                      data={"kind": "done" if words else "negated", "words": sorted(set(words))[:6], "negated_n": negated,
+                                            "evidence_n": evidence, "tool_calls_in_turn": calls, "turn": int(st.get("turn") or 0),
+                                            "text_hash": sha256_hex(text.encode("utf-8", "replace"))[:12], "chars": len(text)})
+            emit(claim)
+            found = incidents.detect_unverified_claims([claim])
+            if found:
+                hist = known_classes(cwd, led)
+                for f in found:
+                    f["data"]["repeat"] = "UNVERIFIED_CLAIM" in hist
+                    emit(f)
+                strict = os.environ.get("KEEL_STRICT") == "1" and blocks < 1 and not inp.get("stop_hook_active")
+                why = "zero tool calls in this turn" if calls == 0 else f"{calls} tool call(s) in this turn and none of them succeeded"
+                reason = ("KEEL UNVERIFIED_CLAIM: the reply contains completion words (" + ", ".join(sorted(set(words))[:4]) +
+                          ") with " + why + ". Attach evidence (the command and its output, a file path) "
+                          "or replace \"done\" with \"not verified\".")
+                if strict:
+                    out = {"decision": "block", "reason": reason,
+                           "hookSpecificOutput": {"hookEventName": "Stop", "decision": "block", "reason": reason}}
+                else:
+                    log(cwd, "stop: " + reason)
+        # the events are written BEFORE the requests are marked as seen: if the write fails, flush_call raises,
+        # the state is not saved (the exception leaves the with-block) and the next Stop imports the usage again
+        flush_call(cwd, out)
+        st["seen_req"] = (seen + new_seen)[-5000:]
         if strict:
             st["stop_blocks_turn"] = blocks + 1
-    why = "zero tool calls in this turn" if calls == 0 else f"{calls} tool call(s) in this turn and none of them succeeded"
-    reason = ("KEEL UNVERIFIED_CLAIM: the reply contains completion words (" + ", ".join(sorted(set(words))[:4]) +
-              ") with " + why + ". Attach evidence (the command and its output, a file path) "
-              "or replace \"done\" with \"not verified\".")
-    if strict:
-        return {"decision": "block", "reason": reason,
-                "hookSpecificOutput": {"hookEventName": "Stop", "decision": "block", "reason": reason}}
-    log(cwd, "stop: " + reason)
-    return None
+    if found:
+        remember_classes(cwd, {"UNVERIFIED_CLAIM"})
+    return out
 
 
 if __name__ == "__main__":

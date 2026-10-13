@@ -24,6 +24,7 @@ import os
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -76,8 +77,54 @@ def cmd_panel(a: argparse.Namespace) -> int:
     return 0
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """True if both names are the same file: equal resolved paths, or the same device and inode
+    (a hard link or any other path to the file)."""
+    try:
+        if a.resolve() == b.resolve():
+            return True
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def _write_via_temp(out: Path, fill, guard=None) -> bool:
+    """Replace `out` atomically with the content `fill(fh)` writes. The temporary file is created by
+    `tempfile.mkstemp` in the output directory (a unique name opened with O_EXCL, so a path that
+    already exists, for example a link to a source file, is never opened for writing), flushed and
+    fsynced, then `os.replace`d over `out`. `guard()` runs just before the replace; a true result
+    abandons the write (returns False). On any failure the temporary file is removed."""
+    fd, name = tempfile.mkstemp(dir=str(out.parent), prefix=f".{out.name}.keel_tmp_")
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fill(fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.chmod(tmp, 0o644)  # mkstemp creates 0600; a report or a shared copy is meant to be readable
+        except OSError:
+            pass
+        if guard is not None and guard():
+            return False
+        os.replace(tmp, out)  # replaces the directory entry: the file behind a link is never truncated
+        return True
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def cmd_report(a: argparse.Namespace) -> int:
     p = Path(a.ledger)
+    out = Path(a.out) if a.out else None
+    if out is not None:
+        inputs = [p] + (sorted(p.glob("*.jsonl")) if p.is_dir() else [])
+        if any(_same_file(out, x) for x in inputs):
+            print("REFUSED: --out is the ledger itself (or one of the ledgers of the directory): "
+                  "the report would overwrite it. Choose another file.")
+            return 2
     label = f"last {a.days:g} days" if a.days else "whole ledger"
     parts = []
     if p.is_dir():
@@ -89,8 +136,15 @@ def cmd_report(a: argparse.Namespace) -> int:
     else:
         parts.append(scoreboard.render_report(_load_result(p, a.days), title=f"Vital signs: {_project_of(p)} ({p.stem})", window_label=label))
     text = "\n\n".join(parts)
-    if a.out:
-        Path(a.out).write_text(text, encoding="utf-8")
+    if out is not None:
+        def guard() -> bool:
+            if any(_same_file(out, x) for x in [p] + (sorted(p.glob("*.jsonl")) if p.is_dir() else [])):
+                print("REFUSED: --out became a link to the ledger during the report")
+                return True
+            return False
+
+        if not _write_via_temp(out, lambda fh: fh.write(text), guard):
+            return 2
         print(f"written {a.out}")
     else:
         print(text)
@@ -112,35 +166,26 @@ def cmd_export(a: argparse.Namespace) -> int:
     from . import schema
     from .ledger import redact_event
     src, out = Path(a.ledger), Path(a.out)
-
-    def same_file() -> bool:
-        if out.resolve() == src.resolve():
-            return True
-        try:  # a hard link or another path to the same file: same device and inode
-            return out.exists() and os.path.samefile(src, out)
-        except OSError:
-            return False
-
-    if same_file():
+    if _same_file(src, out):
         print("REFUSED: --out is the ledger itself (the same path, or a link to the same file)")
         return 2
     events = list(Ledger(a.ledger).iter())  # the whole input is read before anything is written
-    tmp = out.with_name(f".{out.name}.keel_tmp_{os.getpid()}")
     n = 0
-    try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            for e in events:
-                fh.write(schema.dumps(e if a.no_redact else redact_event(e)) + "\n")
-                n += 1
-            fh.flush()
-            os.fsync(fh.fileno())
-        if same_file():
+
+    def fill(fh) -> None:
+        nonlocal n
+        for e in events:
+            fh.write(schema.dumps(e if a.no_redact else redact_event(e)) + "\n")
+            n += 1
+
+    def guard() -> bool:
+        if _same_file(src, out):
             print("REFUSED: --out became a link to the ledger during the export")
-            return 2
-        os.replace(tmp, out)  # replaces the directory entry: the file behind a link is never truncated
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+            return True
+        return False
+
+    if not _write_via_temp(out, fill, guard):
+        return 2
     if a.no_redact:
         print(f"exported {n} events to {a.out} WITHOUT redaction: goal text, predicates, command output tails, "
               f"verdict reasons, incident details and paths are included")

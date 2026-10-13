@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keel-ledger"
-version = "0.2.1"
+version = "0.2.2"
 description = "Local agent observability for Claude Code: an audit trail of Claude Code hooks events in a hash-chained JSONL ledger, retry-loop and tool-error detection, and task verification records."
 readme = "README.md"
 requires-python = ">=3.11"

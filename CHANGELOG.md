@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.2.2 - 2026-10-13
+
+Third independent review. Every fix has a regression test in `tests/test_regressions_022.py` that failed
+on 0.2.1.
+
+Data safety and correctness:
+
+- `export` and `report` write through `tempfile.mkstemp` in the output directory (a unique name opened with
+  O_EXCL), then `os.replace`. A predictable temporary name that already exists, for example a hard link or a
+  symlink to the source ledger, is never opened for writing, so it can no longer truncate the source.
+- `report --out` that is the ledger (the same path, or a link / another path to the same file; for a directory
+  of ledgers, any ledger in it) is refused with a message and exit code 2. The report is written atomically.
+- The ledger append writes every byte or raises: a short write is continued, a zero-byte write raises, and an
+  `fsync` error is no longer swallowed. If a write fails part-way, the partial line is terminated so the next
+  append starts on a fresh line. Callers that mark ids as seen (PostToolUse, SubagentStop) already did it
+  after the write; with this change they can rely on the write being complete.
+- The Stop adapter writes its events (usage, claim, incident) with `flush_call` before it marks the request
+  ids as seen. After a failed write the usage is imported again by the next Stop instead of being lost.
+- The installer reads interpreter options the way CPython does, including combined short flags: any `-c` or
+  `-m` among them (`-Sc`, `-Em`, `-Scprint(123)`) means inline code or a module, so the entry is not a KEEL
+  adapter run and is not removed. An entry is KEEL only when the first non-option argument is exactly the
+  adapter script. `-W` and `-X` values and `--check-hash-based-pycs` are skipped correctly.
+
+Docs:
+
+- `docs/VITALS_SPEC.md`, V13: states which adapters time their state save (SessionStart, UserPromptSubmit,
+  PreToolUse) and which end the span before it (PostToolUse, PostToolUseFailure, SubagentStop, Stop). Stop now
+  matches the others.
+
 ## 0.2.1 - 2026-10-13
 
 Second independent review. Every fix has a regression test in `tests/test_regressions_021.py` that failed

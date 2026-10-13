@@ -119,8 +119,11 @@ of Agent calls and their token share are printed beside it.
 **V13 Layer tax.** Question: what does the control itself cost. Formula: the median `ms` of `layer.cost`
 events; beside it the bytes injected into the context. What is timed: from the start of the `run_hook`
 wrapper (the interpreter has started and the adapter modules are imported) until the events of the call are
-handed to the ledger write. Not timed: interpreter start, imports, the ledger lock, write and fsync, the
-save of the session state file, process exit. Band: reference threshold 50 ms (status reference: shown as
+handed to the ledger write. Not timed: interpreter start, imports, the ledger lock, write and fsync, process exit,
+and the save of the session state file for the adapters that write inside the state lock (PostToolUse,
+PostToolUseFailure, SubagentStop, Stop: they end the span at `flush_call`, before the state is saved, because
+a request or a call id is marked as seen only after its write succeeded). SessionStart, UserPromptSubmit and
+PreToolUse save their state before the span ends, so for them the state save is timed. Band: reference threshold 50 ms (status reference: shown as
 REF, it does not paint the vital red; one machine measured 25-47 ms, the detectors are 0.03 ms of it). Inflate: not writing layer.cost. Defence: the `run_hook` wrapper
 writes it, not the adapter body. Limit: the full wall-clock cost of a hook call is not in V13 (on the test
 machine an empty `python -S -E` process is 70-90 ms and a whole adapter call 200-350 ms);

@@ -57,7 +57,7 @@ ADAPTERS = sorted({p[2] for p in PLAN} | {"pre_tool_use.py"})
 
 
 _PYTHON_EXE = re.compile(r"^(python|pythonw|py)([0-9][0-9.]*)?(\.exe)?$", re.IGNORECASE)
-_OPTS_WITH_ARG = ("-X", "-W", "--check-hash-based-pycs")
+_LONG_OPTS_WITH_ARG = ("--check-hash-based-pycs",)
 
 
 def _split_windows(cmd: str) -> list[str]:
@@ -93,20 +93,32 @@ def _split_command(cmd: str) -> list[str]:
 
 
 def _script_of(cmd: str) -> str | None:
-    """The script a hook command executes: `<python> [options] <script> ...`, else None."""
+    """The script a hook command executes: `<python> [options] <script> ...`, else None.
+
+    Interpreter options are read the way CPython reads them, including combined short flags
+    (`-Sc`, `-Em`): any `-c` or `-m` anywhere in the options means inline code or a module, so the
+    entry is not a script run and None is returned. `-W` and `-X` take a value (the rest of the same
+    argument, else the next one); `--check-hash-based-pycs` takes the next argument."""
     args = _split_command(cmd)
     if len(args) < 2 or not _PYTHON_EXE.match(os.path.basename(args[0].replace("\\", "/"))):
         return None
     i = 1
     while i < len(args):
         a = args[i]
-        if a in ("-c", "-m", "-") or a.startswith(("-c", "-m")) and len(a) > 2 and not a.startswith("--"):
-            return None  # inline code or a module, not a script
-        if a in _OPTS_WITH_ARG:
-            i += 2
+        if a == "-":
+            return None  # the program comes from stdin
+        if a.startswith("--"):
+            i += 2 if a in _LONG_OPTS_WITH_ARG else 1
             continue
         if a.startswith("-"):
-            i += 1
+            skip = 1
+            for j, ch in enumerate(a[1:], start=1):
+                if ch in "cm":
+                    return None  # inline code or a module, not a script (also inside -Sc, -Em, ...)
+                if ch in "WX":
+                    skip = 1 if a[j + 1:] else 2  # the value is the rest of this argument, else the next one
+                    break
+            i += skip
             continue
         return a
     return None
