@@ -8,8 +8,8 @@ points. Recalibrate on your own ledger (`python -m keel report`).
 
 ## 1. Why not "10 out of 10" and not "quality points"
 
-1. An agent's self-assessment is systematically wrong: published agent benchmarks find that most "done"
-   claims are not confirmed by the state of the environment, and models flatter the person they talk to.
+1. An agent's self-assessment is a claim, not evidence. This document cites no external figure for how
+   often such claims are wrong; KEEL measures it on your own ledger (V2 against V3).
 2. A numeric scale is faulty by construction: position bias, scale compression, and a large gap between
    raw agreement and chance-corrected agreement. Production evaluation systems tend to use binary
    pass/fail with a fixed threshold.
@@ -25,7 +25,8 @@ source of the threshold, and a status. A single health number does not exist.
    start recording. A zero with n = 0 is forbidden. A negative control is mandatory: an empty ledger gives
    14 of 14 "NO DATA" (checked by `python -m keel selftest`).
 2. **Count by event and artifact.** No vital reads the agent's report. "Proven" is set only by code after
-   checking predicates; "accepted" is set only by an owner-verdict event from a trusted source.
+   checking predicates; "accepted" is counted only from an owner-verdict event whose source is not the
+   CLI (and that source is not authenticated, see V1).
 3. **A threshold without a source does not paint.** A band with status `reference` gives status REF and
    the hint "beyond the reference threshold", never WARN. A `norm` band must carry a source.
 4. **Too few points = NO DATA.** Vitals with `min_n` (calibration: 8 points) print no value below it.
@@ -53,19 +54,26 @@ band, how to inflate it, and the defence.
 
 ### Product
 
-**V1 Accepted by owner.** Question: does the product reach the person. Formula: the number of
-`owner.verdict` accepts in the window ONLY from trusted sources (`src` in `tg`, `owner`, `owner-file`);
-beside it the number of rejects and of untrusted (cli) verdicts. Band: at least one per window.
-Inflate: write an accept with an agent command. Defence: `keel verdict` from the CLI writes `src=cli`;
-such a verdict does not count in V1 and is printed as `untrusted_accepts`. A trusted source must be a
-channel outside the agent's reach (for example a messaging bot only the human can press).
+**V1 Claimed owner accepts.** Question: does the product reach the person. Formula: the number of
+`owner.verdict` accepts in the window whose `src` is `tg`, `owner` or `owner-file`; beside it the number
+of rejects and of CLI verdicts. Band: at least one per window.
+Inflate: write an accept with an agent command. Defence: `keel verdict` always writes `src=cli` (there is
+no `--src` option; `--by` is recorded as `claimed_by`), and such a verdict does not count in V1 (it is
+printed as `untrusted_accepts`). The other sources are written only through the Python API
+`keel.contract.record_verdict(src=...)`, meant for an owner-side integration (for example a messaging bot
+only the human can press). KEEL ships no such integration, and the ledger is not authenticated: a process
+that can write the ledger file can still append such a line. That is why the vital is named "claimed".
 
-**V2 Proven done.** Question: how many closed tasks are proven by code. Formula: `task.close` with outcome
-verified for which EVERY predicate has a `verify ok=true` with the same `dod_hash` / all `task.close`;
-a verified without that match is printed as `unproven_verified` and is not in the numerator. Band:
-reference, not below 0.8. Inflate: close as verified without checking; append a verify; reopen the task
-with an easy predicate. Defence: a predicate hash at open, verify carries the hash, a second open while
-open is refused, `find_open` takes the first open, the ledger is hash-chained (`keel audit`).
+**V2 Proven done.** Question: how many closed tasks are proven by code. Formula: the contract events are
+replayed in ledger order (`keel.contract.replay`, the same code `close` uses): a `task.close` with outcome
+verified counts only if its `task.open` exists, the close carries the open's `open_id` and `dod_hash`, and
+the LATEST verify of every predicate between that open and that close passed / all `task.close` in the
+window. For a window, opens and verifies from before the window are loaded too. A verified without that
+proof is printed as `unproven_verified`. Band: reference, not below 0.8. Inflate: close as verified without
+checking; append a verify after the close; keep an old pass after a later failure; reopen the task id and
+reuse the previous run's verify; verify in another checkout. Defence: a unique `open_id` per open, the
+absolute project root pinned at open and covered by `dod_hash`, verify runs in that root and carries
+`open_id`, ordered replay, a second open while open is refused, the ledger is hash-chained (`keel audit`).
 
 **V3 Claims with evidence.** Question: how often is "done" accompanied by at least some evidence. Formula:
 `claim` of kind done with evidence_n > 0 / all `claim` of kind done; beside it the number of completion
@@ -181,8 +189,12 @@ week, and its decomposition is always printed beside it.
 3. No viewer or end-user metrics.
 4. Contract predicates are protected by a hash, but there is no detector for "edited the test instead of the
    code" (edits to files named in the predicates after the open).
-5. The "done without evidence" detector is not calibrated against owner verdicts; the first 12 points would
-   give the right to speak about its precision.
-6. The chain catches an edit of a line, but not deletion of the whole file: there is no external copy.
-7. V13 does not see the interpreter start; the MEASURING_BECAME_COST detector watches only internal time.
+5. The "done without evidence" detector is not calibrated against owner verdicts. The point counts used
+   in this document (8 for calibration, 12 before speaking about precision) are working rules of thumb with
+   no published analysis behind them; treat every threshold here as experimental.
+6. The chain catches an edit, insertion, deletion or reorder of a line inside the chain. A cut tail, a
+   deleted file or a rebuilt file are caught only against an external checkpoint
+   (`keel audit --expect-count N --expect-last-hash H`) stored where the agent cannot write.
+7. V13 does not see the interpreter start, and its internal time stops before the ledger write (lock,
+   write, fsync); the MEASURING_BECAME_COST detector watches only internal time and has no live caller.
 8. Completion words are English only (`incidents.DONE_WORDS_RE`); extend it for other languages.

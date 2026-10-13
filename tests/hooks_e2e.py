@@ -38,6 +38,10 @@ def call(hook: str, payload: dict, env: dict | None = None) -> tuple[int, str, f
     return r.returncode, r.stdout.strip(), (time.perf_counter() - t0) * 1000
 
 
+def led_of(cwd: str) -> Ledger:
+    return Ledger(Path(KEEL_HOME) / encode_project_dir(cwd) / "ledger.jsonl")
+
+
 def main() -> int:
     checks = []
     with tempfile.TemporaryDirectory() as td:
@@ -78,12 +82,20 @@ def main() -> int:
         call("pre_tool_use.py", {**base, "hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_input": {"file_path": "C:\\x\\b.py", "old_string": "a", "new_string": "b"}, "tool_use_id": "t2"})
         rc, out, ms = call("post_tool_use.py", {**base, "hook_event_name": "PostToolUse", "tool_name": "Edit", "tool_input": {"file_path": "C:\\x\\b.py", "old_string": "a", "new_string": "b"}, "tool_response": {"ok": True}, "tool_use_id": "t2"})
         checks.append(("edit after real read silent", "BLIND_EDIT" not in out))
-        # four identical failing Bash calls: LOOP is reported exactly once, on the third
+        # four identical failing Bash calls, routed the way Claude Code routes failures: to
+        # PostToolUseFailure (fields error, is_interrupt, duration_ms). LOOP is reported exactly once, on the third
         outs = []
         for i in range(4):
             call("pre_tool_use.py", {**base, "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "pytest -q"}, "tool_use_id": f"b{i}"})
-            rc, o, _ = call("post_tool_use.py", {**base, "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "pytest  -q"}, "tool_response": {"stdout": "1 failed", "is_error": True}, "tool_use_id": f"b{i}"})
+            rc, o, ms = call("post_tool_use_failure.py", {**base, "hook_event_name": "PostToolUseFailure", "tool_name": "Bash", "tool_input": {"command": "pytest  -q"}, "error": "Exit code 1: 1 failed", "is_interrupt": False, "duration_ms": 1234, "tool_use_id": f"b{i}"})
+            lat["post_tool_use_failure"] = ms
             outs.append(o)
+        fails = [e for e in led_of(cwd).iter(ev="tool.call") if e["data"].get("tool_use_id", "").startswith("b")]
+        checks.append(("R9 PostToolUseFailure records ok=false with duration_ms", len(fails) == 4 and all(e["data"]["ok"] is False and e["data"]["ms"] == 1234 for e in fails)))
+        checks.append(("R9 the error text is not stored", not any("1 failed" in json.dumps(e) for e in led_of(cwd).iter())))
+        call("post_tool_use_failure.py", {**base, "hook_event_name": "PostToolUseFailure", "tool_name": "Read", "tool_input": {"file_path": "C:/x/z.py"}, "error": "interrupted", "is_interrupt": True, "tool_use_id": "int1"})
+        intr = [e for e in led_of(cwd).iter(ev="tool.call") if e["data"].get("tool_use_id") == "int1"]
+        checks.append(("R9 an interrupt is recorded as interrupted", bool(intr) and intr[0]["data"].get("interrupted") is True))
         checks.append(("loop silent before 3rd", "LOOP" not in outs[0] and "LOOP" not in outs[1]))
         checks.append(("loop advised exactly on 3rd", "LOOP" in outs[2]))
         checks.append(("loop not repeated on 4th", "LOOP" not in outs[3]))
@@ -150,6 +162,41 @@ def main() -> int:
         checks.append(("subagent usage recorded", len(subs) == 1 and subs[0]["data"]["cache_read"] == 1000))
         call("subagent_stop.py", {**base, "hook_event_name": "SubagentStop", "agent_id": "abc", "agent_transcript_path": str(sub_tr)})
         checks.append(("subagent not double counted", sum(1 for e in led.iter(ev="usage") if str(e["agent"]).startswith("sub")) == 1))
+
+        # R8: a subagent tool call recorded live (PostToolUse fires inside subagents) and again
+        # in the subagent transcript is written once, also after the transcript grows
+        sub2 = {**base, "agent_id": "def"}
+        call("post_tool_use.py", {**sub2, "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": {"stdout": "a"}, "tool_use_id": "st1"})
+        sub_tr2 = sub_dir / "agent-def.jsonl"
+        rows = [
+            {"type": "user", "timestamp": "2026-09-02T10:03:00Z", "isSidechain": True, "message": {"role": "user", "content": "task"}},
+            {"type": "assistant", "timestamp": "2026-09-02T10:03:01Z", "isSidechain": True, "requestId": "s2",
+             "message": {"role": "assistant", "model": "m", "usage": {"input_tokens": 5, "output_tokens": 1},
+                         "content": [{"type": "tool_use", "id": "st1", "name": "Bash", "input": {"command": "ls"}}]}},
+            {"type": "user", "timestamp": "2026-09-02T10:03:02Z", "isSidechain": True, "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "st1", "content": "a"}]}},
+        ]
+        sub_tr2.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        call("subagent_stop.py", {**sub2, "hook_event_name": "SubagentStop", "agent_transcript_path": str(sub_tr2)})
+        rows.append({"type": "assistant", "timestamp": "2026-09-02T10:03:03Z", "isSidechain": True, "requestId": "s3",
+                     "message": {"role": "assistant", "model": "m", "usage": {"input_tokens": 5, "output_tokens": 1}, "content": [{"type": "text", "text": "ok"}]}})
+        sub_tr2.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        call("subagent_stop.py", {**sub2, "hook_event_name": "SubagentStop", "agent_transcript_path": str(sub_tr2)})
+        st1 = [e for e in led.iter(ev="tool.call") if e["data"].get("tool_use_id") == "st1"]
+        checks.append(("R8 subagent tool call written once (live + transcript + regrown transcript)", len(st1) == 1))
+        checks.append(("R8 regrown transcript usage written once per request", sum(1 for e in led.iter(ev="usage") if e["data"].get("req") in ("s2", "s3")) == 2))
+
+        # R12: a read by one agent does not cover an edit by another agent
+        call("post_tool_use.py", {**base, "agent_id": "A", "hook_event_name": "PostToolUse", "tool_name": "Read", "tool_input": {"file_path": "C:/x/shared.py"}, "tool_response": {"type": "text", "file": {"filePath": "C:/x/shared.py", "content": "x" * 300}}, "tool_use_id": "ra"})
+        rc, out, _ = call("post_tool_use.py", {**base, "agent_id": "B", "hook_event_name": "PostToolUse", "tool_name": "Edit", "tool_input": {"file_path": "C:/x/shared.py", "old_string": "a", "new_string": "b"}, "tool_response": {"ok": True}, "tool_use_id": "eb"})
+        checks.append(("R12 edit by agent B after a read by agent A is a blind edit", "BLIND_EDIT" in out))
+
+        # R11: one message with six Agent calls gives at most one FANOUT incident
+        before = sum(1 for e in led.iter(ev="incident") if e["data"]["cls"] == "FANOUT")
+        for i in range(6):
+            call("post_tool_use.py", {**base, "hook_event_name": "PostToolUse", "tool_name": "Agent", "tool_input": {"prompt": f"p{i}"}, "tool_response": "ok", "tool_use_id": f"ag{i}"})
+        after = sum(1 for e in led.iter(ev="incident") if e["data"]["cls"] == "FANOUT")
+        checks.append(("R11 six Agent calls in one message: at most one FANOUT", after - before <= 1))
+        checks.append(("R14 MEMORY_LOST at session start is an incident", any(e["data"]["cls"] == "MEMORY_LOST" for e in led.iter(ev="incident"))))
 
         rc, out, ms = call("session_end.py", {**base, "hook_event_name": "SessionEnd", "reason": "exit"}); lat["session_end"] = ms
         stops = [e for e in led.iter(ev="session.stop") if e["agent"] == "head"]

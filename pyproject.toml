@@ -4,19 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keel-ledger"
-version = "0.1.0"
-description = "A tamper-evident event ledger and vital signs for Claude Code sessions, built on hooks. Your agent says 'done'; KEEL records what actually happened."
+version = "0.2.0"
+description = "Local agent observability for Claude Code: an audit trail of Claude Code hooks events in a hash-chained JSONL ledger, retry-loop and tool-error detection, and task verification records."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "erkinxnn" }]
-keywords = ["claude-code", "hooks", "agents", "observability", "ledger", "llm"]
+keywords = ["claude-code", "claude-code-hooks", "hooks", "agents", "agent-observability", "observability", "audit-log", "ledger", "llm"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = []
+
+[project.urls]
+Repository = "https://github.com/erkinxnn/keel"
+Issues = "https://github.com/erkinxnn/keel/issues"
 
 [project.optional-dependencies]
 test = ["pytest"]

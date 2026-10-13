@@ -9,6 +9,11 @@ Attempts:
     5. `verdict --verdict accept` run by the agent (src=cli)                (V1 must stay NO DATA)
     6. forecast_p = 0.5 always                                              (V14 must say NO DATA, not OK)
     7. a manual predicate can be closed only with evidence                  (must be refused without it)
+    8. an edited ledger line                                                (audit must fail)
+    9. `verdict --src owner` from the CLI                                   (must be refused, nothing counts in V1)
+   10. reopen the same task id and close it with the previous run's verify  (must be refused)
+   11. a verify appended AFTER a forged close                               (V2 must not count it)
+   12. verify the pinned contract from another directory                    (must be refused)
 
 Run: python tests/adversarial/a2_contract_bypass.py   (exit code 0 = every defence held)
 Works in a temporary directory only; it never touches a real ledger.
@@ -116,6 +121,43 @@ def main() -> int:
         lines[1] = lines[1].replace('"repeat":false', '"repeat":true')
         p8.write_text("\n".join(lines) + "\n", encoding="utf-8")
         held("8. editing a ledger line", not led8.audit()["ok"], "(hash chain)")
+
+        # 9. the agent claims owner origin from the CLI
+        p9 = wd / "l9.jsonl"
+        rc9, _ = keel("verdict", "--ledger", str(p9), *common, "--artifact", "out/tape.mp4", "--verdict", "accept", "--src", "owner", cwd=wd)
+        v1b = vitals.compute(Ledger(p9).all())["vitals"]["V1_accepted"]
+        held("9. verdict --src owner from the CLI", rc9 != 0 and v1b["status"] == "NO DATA", f"(rc={rc9}, V1={v1b['status']})")
+
+        # 10. reopen the same task id and reuse the previous run's verify (same second, same predicates)
+        p10 = wd / "l10.jsonl"
+        (wd / "r10.txt").write_text("x" * 20, encoding="utf-8")
+        keel("open", "--ledger", str(p10), *common, "--task", "T10", "--goal", "g", "--dod", "file_min_bytes:r10.txt:5", cwd=wd)
+        keel("verify", "--ledger", str(p10), *common, "--task", "T10", cwd=wd)
+        keel("close", "--ledger", str(p10), *common, "--task", "T10", "--outcome", "verified", cwd=wd)
+        keel("open", "--ledger", str(p10), *common, "--task", "T10", "--goal", "g", "--dod", "file_min_bytes:r10.txt:5", cwd=wd)
+        rc10, _ = keel("close", "--ledger", str(p10), *common, "--task", "T10", "--outcome", "verified", cwd=wd)
+        held("10. reopened task closed with the previous run's verify", rc10 != 0, f"(rc={rc10})")
+
+        # 11. open, forged close verified, then a verify appended after the close
+        led11 = Ledger(wd / "l11.jsonl")
+        o11 = led11.append(schema.make_event("task.open", session="s", project="p", src="cli", task="T11",
+                                             data={"goal": "g", "dod": ["file_exists:x"], "dod_hash": "h11", "open_id": "o11"}))
+        led11.append(schema.make_event("task.close", session="s", project="p", src="cli", task="T11",
+                                       data={"outcome": "verified", "dod": ["file_exists:x"], "dod_hash": "h11", "open_id": "o11"}))
+        led11.append(schema.make_event("verify", session="s", project="p", src="cli", task="T11",
+                                       data={"predicate": "file_exists:x", "ok": True, "evidence": "late", "dod_hash": "h11", "open_id": "o11"}))
+        v2b = vitals.compute(led11.all())["vitals"]["V2_verified_done"]
+        held("11. verify appended after the close", o11 is not None and v2b["value"] == 0.0, f"(V2={v2b['value']})")
+
+        # 12. verify a pinned contract from another directory where the predicate happens to hold
+        other = wd / "other"
+        other.mkdir()
+        (other / "only_here.txt").write_text("x", encoding="utf-8")
+        p12 = wd / "l12.jsonl"
+        keel("open", "--ledger", str(p12), *common, "--task", "T12", "--goal", "g", "--dod", "file_exists:only_here.txt", cwd=wd)
+        rc12v, _ = keel("verify", "--ledger", str(p12), *common, "--task", "T12", "--cwd", str(other), cwd=wd)
+        rc12, _ = keel("close", "--ledger", str(p12), *common, "--task", "T12", "--outcome", "verified", cwd=wd)
+        held("12. verify of a pinned contract from another directory", rc12v != 0 and rc12 != 0, f"(verify rc={rc12v}, close rc={rc12})")
 
     broken = [n for n, ok in RES if not ok]
     print(f"\nA2: {'PASS' if not broken else 'FAIL'} ({len(RES) - len(broken)}/{len(RES)} defences held)")

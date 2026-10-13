@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
 """Install and remove the KEEL adapters in Claude Code settings. The USER runs it, with one command.
 
-    python tools/install_hooks.py --check                 show what is registered now
+    python tools/install_hooks.py --project <path>        only sessions started from that folder
+    python tools/install_hooks.py --check --project <path> show what is registered there
     python tools/install_hooks.py --global                every Claude Code session on the machine
                                                           (any folder, subagents, headless runs)
-    python tools/install_hooks.py --project <path>        only sessions started from that folder
-    python tools/install_hooks.py --global --remove       remove globally (or --project ... --remove)
+    python tools/install_hooks.py --project <path> --remove   remove (or --global --remove)
 
-Before any write a backup `settings.json.bak_keel_<date_time>` is made. Other people's hooks are
-not touched: only groups whose command points into `keel/hooks` are added or removed.
-Six events are registered: SessionStart, UserPromptSubmit, PostToolUse (matcher *), SubagentStop,
-Stop, SessionEnd. PreToolUse is not registered, to save one process per tool call.
+What is touched: only hook ENTRIES whose command runs one of this checkout's adapter scripts
+(the exact absolute paths of `keel/hooks/<adapter>.py`). Other entries, including entries that
+share a group with a KEEL adapter, are kept; a group is dropped only if it becomes empty.
+Registrations that point to ANOTHER copy of KEEL are not recognised and are left alone.
+Before any write a backup `settings.json.bak_keel_<date_time>` is made, and the new file is
+written to a temporary file and renamed over the old one (atomic on the same volume).
 
-The command is run as `python -S -E`: processing site packages at interpreter start costs
-tens of milliseconds on EVERY tool call (measured on one machine: an empty `python` process
-172/240 ms vs `python -S -E` 76/87 ms, median of an alternating run), and the layer does not
-need site at all: it has zero dependencies outside the standard library. `-E` also detaches the
-adapter from the session's PYTHONPATH.
+Seven events are registered: SessionStart, UserPromptSubmit, PostToolUse (matcher *),
+PostToolUseFailure (matcher *), SubagentStop, Stop, SessionEnd. PreToolUse is not registered, to
+save one process per tool call.
+
+The command is `"<this interpreter>" -S -E "<adapter>"`: the absolute path of the Python that ran
+the installer is pinned, so the hooks do not depend on what `python` means in the session's PATH.
+`-S` skips site-packages processing at start (tens of ms on every tool call on the test machine;
+the layer uses only the standard library); `-E` detaches the adapter from PYTHONPATH.
 """
 from __future__ import annotations
 
@@ -33,21 +38,58 @@ if hasattr(sys.stdout, "reconfigure"):
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "keel" / "hooks"
-MARK = "keel"
 
 PLAN = [
     ("SessionStart", None, "session_start.py", 10, "KEEL: session scoreboard"),
     ("UserPromptSubmit", None, "user_prompt_submit.py", 5, "KEEL: order"),
     ("PostToolUse", "*", "post_tool_use.py", 5, "KEEL: ledger"),
+    ("PostToolUseFailure", "*", "post_tool_use_failure.py", 5, "KEEL: failed call"),
     ("SubagentStop", None, "subagent_stop.py", 15, "KEEL: subagent to ledger"),
     ("Stop", None, "stop.py", 15, "KEEL: evidence on done"),
     ("SessionEnd", None, "session_end.py", 5, "KEEL: end of session"),
 ]
+ADAPTERS = sorted({p[2] for p in PLAN} | {"pre_tool_use.py"})
 
 
-def _is_keel(group: dict) -> bool:
-    text = json.dumps(group, ensure_ascii=False).replace("\\\\", "\\").lower()
-    return "keel" in text and "hooks" in text
+def _norm(s: str) -> str:
+    return os.path.normcase(s).replace("\\", "/")
+
+
+def _adapter_paths() -> list[str]:
+    return [_norm(str(HOOKS / a)) for a in ADAPTERS]
+
+
+def _is_keel_hook(h: object) -> bool:
+    """True only for a command entry that runs one of this checkout's adapter scripts."""
+    if not isinstance(h, dict) or h.get("type", "command") != "command":
+        return False
+    cmd = _norm(str(h.get("command") or ""))
+    return any(p in cmd for p in _adapter_paths())
+
+
+def _keel_entries(groups: list) -> list[dict]:
+    return [h for g in groups if isinstance(g, dict) for h in (g.get("hooks") or []) if _is_keel_hook(h)]
+
+
+def _strip_keel(groups: list) -> tuple[list, int]:
+    """Remove KEEL adapter entries, keep every other entry and the groups they live in."""
+    out: list = []
+    removed = 0
+    for g in groups:
+        if not isinstance(g, dict) or not isinstance(g.get("hooks"), list) or not g["hooks"]:
+            out.append(g)
+            continue
+        keep = [h for h in g["hooks"] if not _is_keel_hook(h)]
+        removed += len(g["hooks"]) - len(keep)
+        if len(keep) == len(g["hooks"]):
+            out.append(g)
+        elif keep:
+            out.append({**g, "hooks": keep})
+    return out, removed
+
+
+def _python() -> str:
+    return str(Path(sys.executable).resolve())
 
 
 def _settings_path(project: str | None) -> Path:
@@ -57,6 +99,19 @@ def _settings_path(project: str | None) -> Path:
     return home / ".claude" / "settings.json"
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.keel_tmp_{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def check(path: Path) -> dict[str, int]:
     if not path.exists():
         print(f"{path}: no file")
@@ -64,19 +119,20 @@ def check(path: Path) -> dict[str, int]:
     cfg = json.loads(path.read_text(encoding="utf-8"))
     hooks = cfg.get("hooks", {})
     res = {}
-    for ev, *_ in PLAN:
-        n = sum(1 for g in hooks.get(ev, []) if _is_keel(g))
-        res[ev] = n
+    for ev, _m, script, *_r in PLAN:
+        res[ev] = sum(1 for h in _keel_entries(hooks.get(ev, [])) if _norm(str(HOOKS / script)) in _norm(str(h.get("command"))))
     print(f"{path}:")
     for ev, n in res.items():
         print(f"  {ev:18s} {'registered' if n else 'no'}{' (duplicate x%d)' % n if n > 1 else ''}")
-    others = sum(len(v) for v in hooks.values()) - sum(res.values())
-    print(f"  other hook groups: {others}")
-    slow = [ev for ev, *_ in PLAN
-            for g in hooks.get(ev, []) if _is_keel(g) and "-S -E" not in json.dumps(g, ensure_ascii=False)]
+    others = sum(len(g.get("hooks") or []) for v in hooks.values() if isinstance(v, list) for g in v if isinstance(g, dict)) \
+        - sum(len(_keel_entries(v)) for v in hooks.values() if isinstance(v, list))
+    print(f"  other hook entries: {others}")
+    slow = sorted({ev for ev, *_ in PLAN for h in _keel_entries(hooks.get(ev, [])) if "-S -E" not in str(h.get("command"))})
     if slow:
-        print(f"  WARNING: registered without -S -E: {', '.join(sorted(set(slow)))}: that is tens of extra ms "
-              f"on every call. Re-register: python tools/install_hooks.py --global")
+        print(f"  WARNING: registered without -S -E: {', '.join(slow)}: re-register with --project or --global")
+    for ev, _m, script, *_r in PLAN:
+        if not (HOOKS / script).exists():
+            print(f"  WARNING: adapter file missing: {HOOKS / script}")
     return res
 
 
@@ -84,29 +140,31 @@ def install(path: Path, remove: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     cfg = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
     if path.exists():
-        bak = path.with_name(f"settings.json.bak_keel_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        bak = path.with_name(f"settings.json.bak_keel_{dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
         shutil.copy2(path, bak)
         print(f"backup: {bak}")
     hooks = cfg.setdefault("hooks", {})
     changed = []
+    py = _python()
     for ev, matcher, script, timeout, msg in PLAN:
-        groups = hooks.setdefault(ev, [])
-        before = len(groups)
-        groups[:] = [g for g in groups if not _is_keel(g)]
+        groups, removed = _strip_keel(hooks.get(ev, []))
         if remove:
-            if len(groups) != before:
+            if removed:
                 changed.append(f"-{ev}")
         else:
-            g = {"hooks": [{"type": "command", "command": f'python -S -E "{HOOKS / script}"', "timeout": timeout, "statusMessage": msg}]}
+            g: dict = {"hooks": [{"type": "command", "command": f'"{py}" -S -E "{HOOKS / script}"', "timeout": timeout,
+                                  "statusMessage": msg}]}
             if matcher:
                 g["matcher"] = matcher
             groups.append(g)
             changed.append(f"+{ev}")
-        if not groups:
+        if groups:
+            hooks[ev] = groups
+        else:
             hooks.pop(ev, None)
     if not hooks:
         cfg.pop("hooks", None)
-    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_atomic(path, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
     print(f"{path}: {' '.join(changed) or 'no changes'}")
 
 
@@ -115,19 +173,21 @@ def main() -> int:
     ap.add_argument("--global", dest="glob", action="store_true", help="globally: ~/.claude/settings.json")
     ap.add_argument("--project", help="for one project only: <path>/.claude/settings.json")
     ap.add_argument("--remove", action="store_true", help="remove the KEEL adapters")
-    ap.add_argument("--check", action="store_true", help="only show the state")
+    ap.add_argument("--check", action="store_true", help="only show the state (of --project if given, and of the global file)")
     a = ap.parse_args()
     if not (a.glob or a.project or a.check):
         ap.error("specify --global, --project <path> or --check")
     if a.check:
+        if a.project:
+            check(_settings_path(a.project))
         check(_settings_path(None))
-        check(_settings_path(a.project) if a.project else ROOT / ".claude" / "settings.json")
         return 0
     if a.glob:
         install(_settings_path(None), a.remove)
+        check(_settings_path(None))
     if a.project:
         install(_settings_path(a.project), a.remove)
-    check(_settings_path(None))
+        check(_settings_path(a.project))
     return 0
 
 

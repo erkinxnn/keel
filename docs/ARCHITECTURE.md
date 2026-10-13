@@ -31,17 +31,17 @@ an incident, shows a scoreboard.
 | Component | File | What it does | Check |
 |---|---|---|---|
 | Event schema | `keel/schema.py` | 14 event types, required fields, shape and type validation of numeric fields; a malformed event is not written | selftest "schema rejects bad event", "schema rejects bad int" |
-| Ledger | `keel/ledger.py` | append-only JSONL under an inter-process lock, one write per batch, fsync; hash chain `prev`/`h`, `audit()` catches an edited, inserted or deleted line; streaming read, corrupt lines are counted | selftest "concurrent append loses nothing" (8 processes), "audit catches tamper" |
+| Ledger | `keel/ledger.py` | append-only JSONL under an inter-process lock, one write per batch, fsync; hash chain `prev`/`h`; `audit()` catches an edited line and a line inserted, deleted or moved inside the chain, a cut tail only against an external checkpoint (`--expect-count`, `--expect-last-hash`); the previous hash is found even after a record longer than 64 KiB; streaming read, corrupt lines are counted; `redact_event` for sharing | selftest "concurrent append loses nothing" (8 processes), "audit catches tamper" |
 | One extraction ruler | `keel/extract.py` | result length (what enters the MODEL context, see section 6), error flag, input size, path, path and command normalisation, identical for history and live hooks | selftest "signature ignores shell whitespace", the `flood:` cases, e2e "string error response is error" |
 | Incident registry | `keel/incident_classes.json` | 16 classes with definition, severity, detection mode and rationale | selftest |
 | Detectors | `keel/incidents.py` | LOOP, BLIND_EDIT, FLOOD, STALL, TOOL_ERROR_BURST, FANOUT, UNVERIFIED_CLAIM, REPEAT_ORDER, MEMORY_LOST, MEASURING_BECAME_COST; pure functions over a list of events; a repeat is set from history | selftest, both ends of each detector |
 | Vitals | `keel/vitals.py` | 14 vital signs with n, status and band; NO DATA when there is no source | selftest, negative control |
 | Bands | `keel/vitals_bands.json` | threshold + source + status norm/reference | selftest "bands have source" |
-| Contract | `keel/contract.py` | open/verify/close/verdict; 7 predicate types; predicate hash at open, verify carries the hash, verified only after verify of every predicate with the same hash; a reopen is refused; a verdict has a source, trusted ones are `tg`, `owner`, `owner-file` | selftest "reopen refused", "forged verify with other hash refused", "V1 cli accept -> NO DATA"; `tests/adversarial/a2_contract_bypass.py` |
+| Contract | `keel/contract.py` | open/verify/close/verdict; 7 predicate types; each open has a unique `open_id` and pins the absolute project root, which `dod_hash` covers; verify runs in that root and carries `open_id`; `replay` walks contract events in ledger order and is shared by `close` and V2; a reopen while open is refused; the CLI always writes verdicts with `src=cli` | selftest "reopen refused", "forged verify with other hash refused", "V1 cli accept -> NO DATA"; `tests/adversarial/a2_contract_bypass.py` |
 | Scoreboard | `keel/scoreboard.py` | panel (<= 20 lines, prints its own cost in tokens) and report (markdown) | e2e |
 | Backfill | `keel/backfill.py` | Claude Code transcripts into a ledger, streaming; subagents from `<session>/subagents/`; usage de-duplicated by requestId; the owner's text is not copied | selftest on a synthetic transcript |
 | CLI | `keel/__main__.py` | backfill, vitals, panel, report, audit, doctor, open, verify, close, verdict, incident, classes, selftest | e2e |
-| Hook adapters | `keel/hooks/*.py` | SessionStart, UserPromptSubmit, PreToolUse, PostToolUse (matcher `*`), SubagentStop, Stop (`last_assistant_message`, at most one block per turn), SessionEnd; session state under a lock with a unique temp file; incident class cache `state/classes.json` | `tests/hooks_e2e.py`, selftest "concurrent state keeps all writers", `a8_state_race.py` |
+| Hook adapters | `keel/hooks/*.py` | SessionStart, UserPromptSubmit, PreToolUse, PostToolUse and PostToolUseFailure (matcher `*`), SubagentStop, Stop (`last_assistant_message`, at most one block per turn), SessionEnd; session state under a lock with a unique temp file; incident class cache `state/classes.json` | `tests/hooks_e2e.py`, selftest "concurrent state keeps all writers", `a8_state_race.py` |
 
 ## 3. Data flow of one turn
 
@@ -54,11 +54,16 @@ auto-sync or in the session's context. `KEEL_HOME` overrides `~/.keel`, `KEEL_LE
 2. `PreToolUse` (optional, not registered by the installer, to save one process per call): the call
    timestamp. Without it the duration is counted from the previous event of the session, which is
    enough for a stall longer than 30 minutes.
-3. `PostToolUse` (matcher `*`): a `tool.call` event with duration and result size; the agent is marked
-   by `agent_id` (head or subagent); detectors run over the tail of 12 calls; a new incident is
-   written once and goes to the agent as one line.
+3. `PostToolUse` (matcher `*`): a `tool.call` event with duration (`duration_ms` when the hook sends
+   it) and result size; the agent is marked by `agent_id` (head or subagent); reads and the window of
+   the last 12 calls are kept per agent; detectors run over that window; a new incident is written once
+   and goes to the agent as one line. `PostToolUseFailure` (matcher `*`) does the same for a failed or
+   interrupted call (`ok=false`, `interrupted`), without storing the error text.
 4. `Stop`: the last turn is taken from the transcript: `usage` per new requestId, `claim` with an
-   evidence count; "done" with zero tools = an incident, in strict mode a block with a reason (once).
+   evidence count; "done" with no successful tool result in the turn = an incident, in strict mode a
+   block with a reason (once). It does not check that the result belongs to a task: only a contract does.
+   `SubagentStop` imports the subagent transcript and skips tool calls already recorded live (by
+   `tool_use_id`) and usage rows already imported (by request id).
 5. `SessionEnd`: `session.stop` with the duration and the number of turns.
 6. Every adapter writes `layer.cost` (ms, injected bytes) through the `run_hook` wrapper.
 
@@ -69,10 +74,10 @@ auto-sync or in the session's context. `KEEL_HOME` overrides `~/.keel`, `KEEL_LE
 | `python`, not `pythonw`; traceback to a side log | `pythonw` swallows a NameError | `run_hook` writes `hooks.log` on any error, exit code 0 |
 | fail-open everywhere except money-like claims | fail-closed gates blocked 21-37 % of legitimate commands in one audit | adapters do not block; the one exception is KEEL_STRICT=1 on Stop, at most one block per turn |
 | stdin and stdout explicitly utf-8 | a legacy code page turns non-ASCII letters into dashes | `_common.py` |
-| a registry of registrations checked by an instrument | six hooks silently removed by one config edit stayed dead for weeks | `python -m keel doctor` checks the registration of the six adapters |
+| a registry of registrations checked by an instrument | six hooks silently removed by one config edit stayed dead for weeks | `python -m keel doctor` checks the registration of the seven adapters |
 | a red-team self test of both ends for every detector | stub tests that cannot fail | `keel/selftest.py` |
 | an instrument with no caller is not added | dead instruments pile up | every component has a caller in the table of section 2 |
-| the ledger holds no owner text | privacy, portability | only numbers and hashes |
+| hook events hold no prompt or reply text | privacy, portability | numbers, hashes, tool names, file paths; contract and verdict events are different, see section 10 |
 
 ## 5. Portability
 
@@ -126,12 +131,13 @@ top-level `decision: "block"` + `reason` match too.
 
 Known gaps:
 
-* **PostToolUse fires only for calls that succeed.** Failed calls go to a separate `PostToolUseFailure`
-  event (fields `error`, `is_interrupt`, `duration_ms`), for which there is no adapter yet. In a live ledger
-  `tool.call.ok=false` therefore appears only for string responses that start with "Error", so V6 (tool
-  errors), LOOP-with-failure and TOOL_ERROR_BURST under-count live. History (backfill) is unaffected.
-* PostToolUse and PostToolUseFailure now carry an optional `duration_ms`; the adapter still derives the
-  duration from its own PreToolUse/previous-event bookkeeping.
+* **Failed calls** go to `PostToolUseFailure` (fields `error`, `is_interrupt`, `duration_ms`), handled by
+  `post_tool_use_failure.py` (added in 0.2.0). A setup installed with 0.1.0 has no such registration: re-run
+  `tools/install_hooks.py`. Calls blocked by a PreToolUse hook or denied by a permission rule never ran and
+  are not recorded as tool calls.
+* `duration_ms` is used when the hook sends it (it covers execution, not the permission prompt). Without it
+  the duration comes from PreToolUse (optional) or from the previous event, marked `ms_approx`. Live `ts` is
+  the completion time; backfill `ts` is the call start, so STALL intervals of the two are shifted.
 * The nested `hookSpecificOutput.decision` form printed by `stop.py` in strict mode is not in the current
   reference (the top-level form is the documented one); it is kept from an earlier doc edition.
 
@@ -149,6 +155,19 @@ leave PreToolUse unregistered (the installer does) and keep only the per-turn ev
 
 ## 10. Privacy
 
-The ledger holds no message text, file content or command output: only lengths, hashes, tool names and
-paths. The word sets used to find repeated orders are kept in `state/prompts.jsonl` next to the ledger and
-are never exported.
+What is stored depends on the event:
+
+* **Hook events** (`prompt`, `tool.call`, `usage`, `claim`, `session.*`, `incident`, `layer.cost`): no prompt
+  text, no reply text, no file content, no command output, no error text. They do hold lengths, hashes,
+  tool names, file paths (`tool.call.path`, incident details), the launch directory (`session.start.cwd`),
+  transcript paths, and the completion words found in a reply (`claim.words`, e.g. "done").
+* **Contract and verdict events** (written by the CLI) hold what you give them, verbatim: the goal text, the
+  predicates (paths, regexes, shell commands), the evidence of each verify (for `cmd_exit0` the last 300
+  chars of the command's stdout, for `regex_in_file` up to 80 chars of the matched text), close evidence,
+  verdict reasons and artifact names.
+* **Session state** next to the ledger: `state/prompts.jsonl` keeps the SET OF WORDS of each prompt for 14
+  days (to find repeated orders), which is close to the prompt text; `hooks.log` keeps adapter tracebacks.
+
+Before sharing a ledger use `python -m keel export --ledger L --out X`: it masks goal, predicates, evidence,
+verdict reasons and artifacts, incident details, paths and cwd as `redacted:<hash>` (equal values give equal
+masks). The export keeps the original hashes and therefore no longer passes `audit`. Do not share `state/`.

@@ -141,6 +141,8 @@ def validate(e: dict[str, Any]) -> None:
             raise SchemaError(f"{e['ev']}.{f}={v!r} is not one of {sorted(allowed)}")
     if e["ev"] == "tool.call" and "ok" in d and d["ok"] is not None and not isinstance(d["ok"], bool):
         raise SchemaError("tool.call.ok must be bool or None")
+    if e["ev"] == "verify" and not isinstance(d.get("ok"), bool):
+        raise SchemaError("verify.ok must be a bool (a string such as \"false\" is not a result)")
 
 
 def safe_int(v: Any, default: int = 0) -> int:

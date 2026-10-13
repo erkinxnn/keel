@@ -5,12 +5,13 @@
     vitals     vital signs of a ledger (json)
     panel      compact scoreboard (what the agent sees at session start)
     report     full markdown report for one ledger or a directory of ledgers
-    audit      hash-chain integrity of a ledger
+    audit      hash-chain integrity of a ledger (with an optional external checkpoint)
+    export     copy a ledger for sharing; text-bearing fields are redacted by default
     doctor     interpreter start cost, ledger integrity, hook registration
     open       open a task contract
     verify     run the done-predicates of an open task (--ok for manual ones)
     close      close a task (verified is accepted only after verify)
-    verdict    record the owner's verdict verbatim (an accept from cli does not count in V1)
+    verdict    record a verdict; the CLI always writes src=cli, which does not count in V1
     incident   record an incident by hand (a class from the registry)
     classes    show the registry of incident classes
     selftest   red-team self test of both ends
@@ -41,8 +42,11 @@ def _since(days: float | None) -> datetime | None:
 
 def _load_result(ledger_path: Path, days: float | None):
     led = Ledger(ledger_path)
-    ev = led.all(since=_since(days))
-    return vitals.compute(ev)
+    since = _since(days)
+    ev = led.all(since=since)
+    # a close inside the window may belong to an open (and verifies) before it
+    contract_ev = led.all(ev=set(contract.CONTRACT_EVENTS)) if since else None
+    return vitals.compute(ev, contract_events=contract_ev)
 
 
 def _project_of(ledger_path: Path) -> str:
@@ -94,11 +98,34 @@ def cmd_report(a: argparse.Namespace) -> int:
 
 
 def cmd_audit(a: argparse.Namespace) -> int:
-    r = Ledger(a.ledger).audit()
+    r = Ledger(a.ledger).audit(expect_count=a.expect_count, expect_last_hash=a.expect_last_hash)
     print(f"AUDIT: {'OK' if r['ok'] else 'FAIL'} events {r['events']}, breaks {r['breaks']}")
     for d in r["details"]:
         print(f"  line {d['line']}: {d['why']}")
+    if r.get("last_hash"):
+        print(f"checkpoint (store it where the agent cannot write; the chain alone does not detect a cut tail): "
+              f"--expect-count {r['events']} --expect-last-hash {r['last_hash']}")
     return 0 if r["ok"] else 1
+
+
+def cmd_export(a: argparse.Namespace) -> int:
+    from . import schema
+    from .ledger import redact_event
+    if Path(a.out).resolve() == Path(a.ledger).resolve():
+        print("REFUSED: --out must be another file")
+        return 2
+    n = 0
+    with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
+        for e in Ledger(a.ledger).iter():
+            fh.write(schema.dumps(e if a.no_redact else redact_event(e)) + "\n")
+            n += 1
+    if a.no_redact:
+        print(f"exported {n} events to {a.out} WITHOUT redaction: goal text, predicates, command output tails, "
+              f"verdict reasons, incident details and paths are included")
+    else:
+        print(f"exported {n} events to {a.out}; redacted: goal, predicates, verify evidence, verdict reasons and artifacts, "
+              f"incident details, paths, cwd. The copy keeps the original hashes and does not pass audit.")
+    return 0
 
 
 def cmd_doctor(a: argparse.Namespace) -> int:
@@ -123,7 +150,8 @@ def cmd_doctor(a: argparse.Namespace) -> int:
     else:
         print(f"ledger {lp}: no file (the layer has not run live)")
     # registration: the global file covers all projects, the project file only its own; pre_tool_use is optional
-    required = ["session_start.py", "user_prompt_submit.py", "post_tool_use.py", "subagent_stop.py", "stop.py", "session_end.py"]
+    required = ["session_start.py", "user_prompt_submit.py", "post_tool_use.py", "post_tool_use_failure.py",
+                "subagent_stop.py", "stop.py", "session_end.py"]
     home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or "~").expanduser()
     candidates = [("global", home / ".claude" / "settings.json"), ("project", Path(a.project or ".") / ".claude" / "settings.json")]
     covered: set[str] = set()
@@ -137,7 +165,8 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         extra = " + pre_tool_use.py" if "pre_tool_use.py" in txt else ""
         print(f"registration {label} ({settings}): {len(have)}/{len(required)}{extra}")
     missing = [n for n in required if n not in covered]
-    print("adapters covered: " + ("all 6" if not missing else f"{6 - len(missing)}/6, missing: {', '.join(missing)}"))
+    print("adapters covered: " + (f"all {len(required)}" if not missing
+                                  else f"{len(required) - len(missing)}/{len(required)}, missing: {', '.join(missing)}"))
     rc |= 1 if missing else 0
     return rc
 
@@ -154,7 +183,8 @@ def cmd_open(a: argparse.Namespace) -> int:
     if a.budget_minutes:
         budget["minutes"] = a.budget_minutes
     try:
-        e = contract.open_task(led, task=a.task, goal=a.goal, dod=a.dod, budget=budget, forecast_p=a.p, zone=a.zone or [], **_ctx(a))
+        e = contract.open_task(led, task=a.task, goal=a.goal, dod=a.dod, budget=budget, forecast_p=a.p, zone=a.zone or [],
+                               root=a.root, **_ctx(a))
     except contract.ContractError as exc:
         print(f"REFUSED: {exc}")
         return 2
@@ -172,7 +202,7 @@ def cmd_verify(a: argparse.Namespace) -> int:
             return 2
         manual = dict(zip(a.ok, ev))
     try:
-        out = contract.verify(led, task=a.task, cwd=Path(a.cwd or "."), manual_ok=manual, **_ctx(a))
+        out = contract.verify(led, task=a.task, cwd=(Path(a.cwd) if a.cwd else None), manual_ok=manual, **_ctx(a))
     except contract.ContractError as exc:
         print(f"REFUSED: {exc}")
         return 2
@@ -197,13 +227,13 @@ def cmd_close(a: argparse.Namespace) -> int:
 def cmd_verdict(a: argparse.Namespace) -> int:
     led = Ledger(a.ledger)
     try:
-        e = contract.record_verdict(led, artifact=a.artifact, verdict=a.verdict, reasons=a.reason or [], src=a.src, **_ctx(a))
+        e = contract.record_verdict(led, artifact=a.artifact, verdict=a.verdict, reasons=a.reason or [], src="cli",
+                                    claimed_by=a.by, **_ctx(a))
     except contract.ContractError as exc:
         print(f"REFUSED: {exc}")
         return 2
-    if a.src not in contract.TRUSTED_VERDICT_SRC:
-        print(f"WARNING: source {a.src!r} is untrusted, this verdict does not count in V1 'accepted by owner' "
-              f"(trusted: {', '.join(contract.TRUSTED_VERDICT_SRC)})")
+    print("NOTE: recorded with src=cli. The CLI cannot record an owner-channel verdict, so this does not count in V1; "
+          "an owner-side integration writes those through keel.contract.record_verdict.")
     print(json.dumps(e, ensure_ascii=False))
     return 0
 
@@ -249,7 +279,13 @@ def main(argv: list[str] | None = None) -> int:
     s = sub.add_parser("report"); s.add_argument("--ledger", required=True, help="a ledger file or a directory of ledgers")
     s.add_argument("--days", type=float); s.add_argument("--out"); s.set_defaults(fn=cmd_report)
 
-    s = sub.add_parser("audit"); s.add_argument("--ledger", required=True); s.set_defaults(fn=cmd_audit)
+    s = sub.add_parser("audit"); s.add_argument("--ledger", required=True)
+    s.add_argument("--expect-count", type=int, help="events in an earlier audit (external checkpoint)")
+    s.add_argument("--expect-last-hash", help="last_hash of that earlier audit (full, or at least 16 chars)")
+    s.set_defaults(fn=cmd_audit)
+    s = sub.add_parser("export"); s.add_argument("--ledger", required=True); s.add_argument("--out", required=True)
+    s.add_argument("--no-redact", action="store_true", help="copy as is, including goal text, command output tails and paths")
+    s.set_defaults(fn=cmd_export)
     s = sub.add_parser("doctor"); s.add_argument("--ledger"); s.add_argument("--project"); s.set_defaults(fn=cmd_doctor)
 
     def ctx(p: argparse.ArgumentParser) -> None:
@@ -257,9 +293,12 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("open"); ctx(s); s.add_argument("--task", required=True); s.add_argument("--goal", required=True)
     s.add_argument("--dod", nargs="+", required=True); s.add_argument("--budget-tokens", type=int); s.add_argument("--budget-minutes", type=int)
-    s.add_argument("--p", type=float); s.add_argument("--zone", nargs="*"); s.set_defaults(fn=cmd_open)
+    s.add_argument("--p", type=float); s.add_argument("--zone", nargs="*")
+    s.add_argument("--root", help="project root the predicates run in (default: the current directory); pinned at open")
+    s.set_defaults(fn=cmd_open)
 
-    s = sub.add_parser("verify"); ctx(s); s.add_argument("--task", required=True); s.add_argument("--cwd")
+    s = sub.add_parser("verify"); ctx(s); s.add_argument("--task", required=True)
+    s.add_argument("--cwd", help="optional; must equal the root pinned at open")
     s.add_argument("--ok", nargs="*", help="manual predicates manual:... that are closed by a word")
     s.add_argument("--evidence", nargs="*", help="evidence for each --ok, in the same order"); s.set_defaults(fn=cmd_verify)
 
@@ -269,8 +308,8 @@ def main(argv: list[str] | None = None) -> int:
 
     s = sub.add_parser("verdict"); ctx(s); s.add_argument("--artifact", required=True)
     s.add_argument("--verdict", required=True, choices=["accept", "reject"]); s.add_argument("--reason", nargs="*")
-    s.add_argument("--src", default="cli", choices=["cli", "tg", "owner", "owner-file"],
-                   help="verdict source; only tg, owner, owner-file count in V1"); s.set_defaults(fn=cmd_verdict)
+    s.add_argument("--by", help="who gave the verdict, recorded as a claim (data.claimed_by); the source stays cli")
+    s.set_defaults(fn=cmd_verdict)
 
     s = sub.add_parser("incident"); ctx(s); s.add_argument("--cls", required=True); s.add_argument("--detail", default=""); s.set_defaults(fn=cmd_incident)
 

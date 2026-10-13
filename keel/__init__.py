@@ -25,4 +25,4 @@ Standard library only, Python 3.11+. No dependencies.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

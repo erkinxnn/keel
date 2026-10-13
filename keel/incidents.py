@@ -69,6 +69,10 @@ def _rx() -> dict:
 
 def _mk(base: dict[str, Any], cls: str, detail: dict[str, Any], ts: str | None = None) -> dict[str, Any]:
     c = CLASSES[cls]
+    data: dict[str, Any] = {"cls": cls, "severity": c["severity"], "repeat": False, "detail": detail}
+    at = (base.get("data") or {}).get("tool_use_id")
+    if at:
+        data["at"] = str(at)  # the call that triggered it: identity for de-duplication
     return schema.make_event(
         "incident",
         session=base["session"],
@@ -77,8 +81,22 @@ def _mk(base: dict[str, Any], cls: str, detail: dict[str, Any], ts: str | None =
         src=base.get("src", "cli"),
         task=base.get("task"),
         ts=ts or base["ts"],
-        data={"cls": cls, "severity": c["severity"], "repeat": False, "detail": detail},
+        data=data,
     )
+
+
+def incident_key(inc: dict[str, Any]) -> str:
+    """Identity of an incident for "do not report it twice". FLOOD is per call (two different
+    reads of the same size are two floods), FANOUT is per model message (the agent count grows
+    while the message's calls arrive), the rest by class and detail."""
+    d = inc["data"]
+    cls = str(d.get("cls"))
+    det = d.get("detail") or {}
+    if cls == "FLOOD" and d.get("at"):
+        return f"FLOOD:{d['at']}"
+    if cls == "FANOUT" and isinstance(det, dict):
+        return f"FANOUT:{det.get('msg')}"
+    return cls + ":" + json.dumps(det, ensure_ascii=False, sort_keys=True)
 
 
 def detect_loops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -190,14 +208,17 @@ def detect_fanout(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def detect_unverified_claims(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """A claim of kind=done with evidence_n == 0 and tool_calls_in_turn == 0 is a claim without evidence."""
+    """A claim of kind=done with no successful tool result in its turn (evidence_n == 0) is a claim
+    without evidence, whether no tool ran at all or every tool call failed. This is still a proxy:
+    it does not check that the successful result belongs to the claimed task (only a contract does)."""
     out = []
     for e in events:
         if e["ev"] != "claim" or e["data"].get("kind") not in ("done", None):
             continue
         d = e["data"]
-        if schema.safe_int(d.get("evidence_n")) == 0 and schema.safe_int(d.get("tool_calls_in_turn")) == 0 and d.get("words"):
-            out.append(_mk(e, "UNVERIFIED_CLAIM", {"kind": d.get("kind"), "words": d.get("words")}))
+        if schema.safe_int(d.get("evidence_n")) == 0 and d.get("words"):
+            reason = "no_tools" if schema.safe_int(d.get("tool_calls_in_turn")) == 0 else "no_successful_result"
+            out.append(_mk(e, "UNVERIFIED_CLAIM", {"kind": d.get("kind"), "words": d.get("words"), "reason": reason}))
     return out
 
 

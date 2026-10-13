@@ -269,6 +269,8 @@ def parse_session(
                         "in_bytes": call["in_bytes"], "out_bytes": out_bytes,
                         "sig": call["sig"], "path": call["path"], "turn": call["turn"], "msg": call.get("msg"),
                     }
+                    if tid and tid != "None":
+                        data["tool_use_id"] = tid
                     if raw_ms < 0:
                         data["skew_ms"] = raw_ms
                     events.append(
@@ -309,7 +311,8 @@ def parse_session(
             schema.make_event(
                 "tool.call", session=session_id, project=project, agent=call["agent"], src=src, ts=_iso(call["ts"]),
                 data={"tool": call["tool"], "ok": None, "ms": None, "in_bytes": call["in_bytes"], "out_bytes": 0,
-                      "sig": call["sig"], "path": call["path"], "turn": call["turn"], "msg": call.get("msg"), "unfinished": True},
+                      "sig": call["sig"], "path": call["path"], "turn": call["turn"], "msg": call.get("msg"), "unfinished": True,
+                      **({"tool_use_id": tid} if tid and tid != "None" else {})},
             )
         )
     events.append(

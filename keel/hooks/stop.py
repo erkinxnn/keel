@@ -123,8 +123,9 @@ def main(inp):
         strict = os.environ.get("KEEL_STRICT") == "1" and blocks < 1 and not inp.get("stop_hook_active")
         if strict:
             st["stop_blocks_turn"] = blocks + 1
+    why = "zero tool calls in this turn" if calls == 0 else f"{calls} tool call(s) in this turn and none of them succeeded"
     reason = ("KEEL UNVERIFIED_CLAIM: the reply contains completion words (" + ", ".join(sorted(set(words))[:4]) +
-              ") with zero tool calls in this turn. Attach evidence (the command and its output, a file path) "
+              ") with " + why + ". Attach evidence (the command and its output, a file path) "
               "or replace \"done\" with \"not verified\".")
     if strict:
         return {"decision": "block", "reason": reason,

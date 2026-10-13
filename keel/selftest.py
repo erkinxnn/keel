@@ -3,7 +3,8 @@
 gives solid NO DATA, outcome verified is not written without verify, the ledger loses no events
 under concurrent writes, the hash chain catches an edit, a contract cannot be reopened, a forged
 verify with a foreign hash does not count, a verdict from cli does not reach V1, the flood metric
-measures model-visible output (not hook payloads), and V4 uses active time.
+measures model-visible output (not hook payloads), and V4 uses active time. The R-checks at the
+end are regressions for the defects found by the independent review of 0.1.0.
 
 Run: python -m keel selftest    (expected: SELFTEST: PASS n/n, exit code 0)
 """
@@ -45,6 +46,237 @@ def _spawn_writers(path: Path, writers: int, per: int) -> list[subprocess.Popen]
         "    led.append(schema.make_event('tool.call', session='s', project='p', src='test', data={'tool': 'Bash', 'ok': True, 'ms': i, 'in_bytes': 1, 'out_bytes': 1, 'sig': 'x', 'path': None, 'turn': 1}))\n"
     ) % (str(ROOT), str(path), per)
     return [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) for _ in range(writers)]
+
+
+def _quiet(fn, *args, **kw):
+    """Run fn with stdout/stderr captured; returns (result_or_exit_code, text)."""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            res = fn(*args, **kw)
+        except SystemExit as exc:
+            res = exc.code if exc.code is not None else 0
+    return res, buf.getvalue()
+
+
+def _review_regressions(add, t0: datetime) -> None:
+    """Regressions for the defects found by the independent review of 0.1.0 (R1..R18).
+    Every check here failed on 0.1.0 (or crashed, which counts as a failure) unless it is
+    marked "(documented limit)"."""
+    from . import __main__ as cli
+
+    def check(name: str, fn) -> None:
+        try:
+            ok = bool(fn())
+            add(name, ok)
+        except Exception as exc:  # noqa: BLE001
+            add(name, False, f"{type(exc).__name__}: {exc}")
+
+    def opener(led: Ledger, task: str, dod: list[str], root: Path, goal: str = "g") -> dict:
+        try:
+            return contract.open_task(led, session="s", project="p", task=task, goal=goal, dod=dod, root=str(root))
+        except TypeError:  # 0.1.0 had no pinned root
+            return contract.open_task(led, session="s", project="p", task=task, goal=goal, dod=dod)
+
+    with tempfile.TemporaryDirectory() as tds:
+        td = Path(tds)
+
+        # R1: the CLI cannot claim owner origin
+        lp1 = td / "r1.jsonl"
+        base = ["verdict", "--ledger", str(lp1), "--session", "s", "--project", "p", "--artifact", "a", "--verdict", "accept"]
+        rc, _ = _quiet(cli.main, base + ["--src", "owner"])
+        check("R1 CLI verdict --src owner is refused",
+              lambda: rc not in (0, None) and not any(e.get("src") in contract.TRUSTED_VERDICT_SRC for e in Ledger(lp1).iter(ev="owner.verdict")))
+        rc2, _ = _quiet(cli.main, base + ["--by", "owner"])
+
+        def r1b() -> bool:
+            evs = Ledger(lp1).all(ev="owner.verdict")
+            v1 = vitals.compute(evs)["vitals"]["V1_accepted"]
+            return rc2 == 0 and bool(evs) and all(e["src"] == "cli" for e in evs) and evs[-1]["data"].get("claimed_by") == "owner" \
+                and v1["status"] == "NO DATA"
+        check("R1 CLI verdict records src=cli and claimed_by, V1 stays NO DATA", r1b)
+
+        # R2: a reopened task cannot reuse the verify of the previous run (same second, same predicates)
+        led2 = Ledger(td / "r2.jsonl")
+        f2 = td / "r2.txt"
+        f2.write_text("x" * 10, encoding="utf-8")
+        dod2 = [f"file_min_bytes:{f2}:5"]
+
+        def r2() -> bool:
+            opener(led2, "R2", dod2, td)
+            contract.verify(led2, task="R2", cwd=td, session="s", project="p")
+            contract.close_task(led2, task="R2", outcome="verified", session="s", project="p")
+            opener(led2, "R2", dod2, td)
+            try:
+                contract.close_task(led2, task="R2", outcome="verified", session="s", project="p")
+                return False
+            except contract.ContractError:
+                return True
+        check("R2 reopened task cannot reuse the previous run's verify", r2)
+        check("R2 every open has a unique open_id",
+              lambda: len({o["data"].get("open_id") for o in led2.all(ev="task.open")}) == 2 and all(o["data"].get("open_id") for o in led2.all(ev="task.open")))
+        check("R2 verify and close reference the open_id",
+              lambda: all(v["data"].get("open_id") for v in led2.all(ev={"verify", "task.close"})))
+
+        # R3: the contract is pinned to an absolute project root
+        ra, rb = td / "rootA", td / "rootB"
+        ra.mkdir()
+        rb.mkdir()
+        (rb / "marker.txt").write_text("x", encoding="utf-8")
+        led3 = Ledger(td / "r3.jsonl")
+
+        def r3() -> bool:
+            opener(led3, "R3", ["file_exists:marker.txt"], ra)
+            try:
+                res = contract.verify(led3, task="R3", cwd=rb, session="s", project="p")
+            except contract.ContractError:
+                return True
+            if not all(e["data"]["ok"] for e in res):
+                return True
+            try:
+                contract.close_task(led3, task="R3", outcome="verified", session="s", project="p")
+                return False
+            except contract.ContractError:
+                return True
+        check("R3 verify in a foreign directory cannot prove a pinned contract", r3)
+        check("R3 the contract hash includes the project root",
+              lambda: contract.dod_hash(["file_exists:x"], str(ra)) != contract.dod_hash(["file_exists:x"], str(rb)))
+        check("R3 open pins an absolute root",
+              lambda: Path(led3.all(ev="task.open")[0]["data"]["root"]).is_absolute())
+
+        # R4: "proven done" replays the contract in order (shared with close_task)
+        o = _ev("task.open", t0, {"goal": "g", "dod": ["file_exists:x"], "dod_hash": "h1", "open_id": "o1"}, task="T")
+        c = _ev("task.close", t0, {"outcome": "verified", "dod": ["file_exists:x"], "dod_hash": "h1", "open_id": "o1"}, task="T")
+        vt = _ev("verify", t0, {"predicate": "file_exists:x", "ok": True, "evidence": "e", "dod_hash": "h1", "open_id": "o1"}, task="T")
+        vf = _ev("verify", t0, {"predicate": "file_exists:x", "ok": False, "evidence": "e", "dod_hash": "h1", "open_id": "o1"}, task="T")
+
+        def v2(evs, **kw):
+            return vitals.compute(evs, **kw)["vitals"]["V2_verified_done"]["value"]
+        check("R4 verify after close does not prove", lambda: v2([o, c, vt, vf]) == 0.0)
+        check("R4 a later failed verify wins", lambda: v2([o, vt, vf, c]) == 0.0)
+        check("R4 close without an open does not prove", lambda: v2([vt, c]) == 0.0)
+        check("R4 open, verify, close proves", lambda: v2([o, vt, c]) == 1.0)
+        check("R4 window report loads the open and verify from before the window", lambda: v2([c], contract_events=[o, vt, c]) == 1.0)
+
+        # R5: the installer touches only its own adapter entries
+        ih_path = ROOT / "tools" / "install_hooks.py"
+        if ih_path.exists():
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("keel_install_hooks_selftest", ih_path)
+            ih = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(ih)  # type: ignore[union-attr]
+            sd = td / "proj" / "settings_dir"  # install() takes the file path; no .claude dir needed
+            sd.mkdir(parents=True)
+            sp = sd / "settings.json"
+            adapter = f'python -S -E "{ih.HOOKS / "post_tool_use.py"}"'
+            sp.write_text(json.dumps({"hooks": {"PostToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": "echo keep me", "statusMessage": "Check KEEL build"}]},
+                {"matcher": "*", "hooks": [{"type": "command", "command": adapter}, {"type": "command", "command": "echo neighbour"}]},
+            ]}, "model": "x"}), encoding="utf-8")
+            _quiet(ih.install, sp, True)
+
+            def cmds(ev: str) -> list[str]:
+                cfg = json.loads(sp.read_text(encoding="utf-8"))
+                return [h.get("command", "") for g in cfg.get("hooks", {}).get(ev, []) for h in g.get("hooks", [])]
+            check("R5 remove keeps a foreign group that mentions KEEL", lambda: "echo keep me" in cmds("PostToolUse"))
+            check("R5 remove keeps a neighbour in a mixed group", lambda: "echo neighbour" in cmds("PostToolUse"))
+            check("R5 remove drops the KEEL adapter entry", lambda: not any("post_tool_use.py" in x for x in cmds("PostToolUse")))
+            check("R5 a backup is written", lambda: any(p.name.startswith("settings.json.bak_keel_") for p in sd.iterdir()))
+            _quiet(ih.install, sp, False)
+            check("R5 install registers each adapter once and keeps the neighbours",
+                  lambda: all(sum(1 for x in cmds(ev) if script in x) == 1 for ev, _m, script, *_r in ih.PLAN)
+                  and "echo keep me" in cmds("PostToolUse") and "echo neighbour" in cmds("PostToolUse")
+                  and json.loads(sp.read_text(encoding="utf-8")).get("model") == "x")
+            check("R5 no temporary file is left behind", lambda: not any("tmp" in p.name for p in sd.iterdir()))
+            # R9: the failure adapter is part of the plan and of the snippet
+            check("R9 PostToolUseFailure is registered by the installer",
+                  lambda: any(ev == "PostToolUseFailure" and (ih.HOOKS / s).exists() for ev, _m, s, *_r in ih.PLAN))
+        check("R9 settings.snippet.json registers PostToolUseFailure",
+              lambda: "PostToolUseFailure" in json.loads((ROOT / "keel" / "hooks" / "settings.snippet.json").read_text(encoding="utf-8"))["hooks"])
+
+        # R6: audit limits are explicit; a checkpoint catches tail truncation; a missing file is not clean
+        p6 = td / "r6.jsonl"
+        led6 = Ledger(p6)
+        for i in range(3):
+            led6.append(_ev("incident", t0, {"cls": "STALL", "severity": "high", "repeat": False, "detail": {"minutes": 40 + i}}))
+        cp = led6.audit()
+        p6.write_text("\n".join(p6.read_text(encoding="utf-8").splitlines()[:2]) + "\n", encoding="utf-8")
+        check("R6 tail truncation passes a plain audit (documented limit)", lambda: led6.audit()["ok"])
+        check("R6 tail truncation is caught with a checkpoint",
+              lambda: not led6.audit(expect_count=3, expect_last_hash=cp["last_hash"])["ok"])
+        check("R6 a missing ledger file is not a clean audit", lambda: not Ledger(td / "missing.jsonl").audit()["ok"])
+
+        # R7: contract evidence can hold command output; a redacted export drops it
+        p7 = td / "r7.jsonl"
+        led7 = Ledger(p7)
+
+        def r7() -> bool:
+            opener(led7, "R7", ["cmd_exit0:echo sensitive-output"], td, goal="secret goal text")
+            contract.verify(led7, task="R7", cwd=td, session="s", project="p")
+            raw = p7.read_text(encoding="utf-8")
+            out = td / "r7_export.jsonl"
+            rc, _ = _quiet(cli.main, ["export", "--ledger", str(p7), "--out", str(out)])
+            exp = out.read_text(encoding="utf-8")
+            return "sensitive-output" in raw and rc == 0 and "sensitive-output" not in exp and "secret goal" not in exp \
+                and len(exp.splitlines()) == len(raw.splitlines())
+        check("R7 the ledger keeps the stdout tail; the default export redacts it and the goal", r7)
+
+        # R8: one tool call seen twice (live hook + subagent transcript) is counted once
+        a1 = _call(t0, "Bash", ok=False)
+        a1["data"]["tool_use_id"] = "tu9"
+        a2 = json.loads(json.dumps(a1))
+        a2["agent"] = "sub:x"
+        check("R8 tool.call with the same tool_use_id counted once",
+              lambda: vitals.compute([a1, a2])["vitals"]["V6_tool_error_rate"]["n"] == 1)
+
+        # R10: a "done" after only failed tools is a claim without evidence
+        cl = _ev("claim", t0, {"kind": "done", "words": ["done"], "evidence_n": 0, "tool_calls_in_turn": 1})
+        check("R10 done after only failed tools is UNVERIFIED_CLAIM", lambda: len(incidents.detect_unverified_claims([cl])) == 1)
+
+        # R11: incident de-duplication keys an event, not a coincidence of numbers
+        def r11() -> bool:
+            fl = [incidents.detect_floods([dict(_call(t0, "Read", out_bytes=25_000), data={**_call(t0, "Read", out_bytes=25_000)["data"], "tool_use_id": t})])[0]
+                  for t in ("x1", "x2")]
+            fan = [incidents.detect_fanout([_call(t0, "Agent", msg="m1") for _ in range(n)])[0] for n in (4, 5, 6)]
+            return incidents.incident_key(fl[0]) != incidents.incident_key(fl[1]) and len({incidents.incident_key(f) for f in fan}) == 1
+        check("R11 FLOOD keyed per call, FANOUT per message", r11)
+
+        # R15: the V13 band that is documented is the band that is loaded
+        check("R15 V13 band loads warn_above 50", lambda: vitals.BANDS["V13_layer_tax_ms"]["warn_above"] == 50)
+
+        # R16: a record longer than 64 KiB does not restart the chain
+        p16 = td / "r16.jsonl"
+        led16 = Ledger(p16)
+        led16.append(_ev("incident", t0, {"cls": "STALL", "severity": "high", "repeat": False, "detail": {"text": "y" * 70_000}}))
+        led16.append(_ev("incident", t0, {"cls": "STALL", "severity": "high", "repeat": False, "detail": {"text": "z"}}))
+        check("R16 chain continues after a 70,000-char record", lambda: led16.audit()["ok"])
+
+        # R17: Windows absolute paths in path:argument predicates
+        f17 = (td / "r17.txt").resolve()
+        f17.write_text("KEEL here", encoding="utf-8")
+        check("R17 regex_in_file with an absolute path", lambda: contract.PREDICATES["regex_in_file"](f"{f17}:KEEL", td)[0])
+        check("R17 file_newer_than with an absolute path",
+              lambda: contract.PREDICATES["file_newer_than"](f"{f17}:2000-01-01T00:00:00+00:00", td)[0])
+
+        # R18: corrupted rows do not crash audit or vitals, and a string "ok" is not a proof
+        p18 = td / "r18.jsonl"
+        led18 = Ledger(p18)
+        led18.append(_ev("prompt", t0, {"chars": 1, "words": 1}))
+        with open(p18, "a", encoding="utf-8") as fh:
+            fh.write("[]\n")
+        check("R18 audit survives a non-object line", lambda: led18.audit()["ok"] is False)
+        check("R18 vitals survive an event without session",
+              lambda: vitals.compute([{"ev": "tool.call", "ts": t0.isoformat(), "data": {"tool": "Bash", "ok": True}}])["bad_events"] == 1)
+
+        def r18c() -> bool:
+            try:
+                schema.make_event("verify", session="s", project="p", task="T", data={"predicate": "manual:x", "ok": "false", "dod_hash": "h"})
+                return False
+            except schema.SchemaError:
+                return True
+        check("R18 verify.ok must be a bool", r18c)
 
 
 def run() -> int:
@@ -133,14 +365,16 @@ def run() -> int:
     add("brier honest forecast -> value", vitals.compute(honest)["vitals"]["V14_calibration_brier"]["value"] is not None)
     add("V14 extra mean_p", vitals.compute(honest)["vitals"]["V14_calibration_brier"]["extra"]["mean_p"] == 0.9)
 
-    # --- V2: verified without verify events carrying the same hash does not count
+    # --- V2: verified only after open -> verify (same hash) -> close, replayed in ledger order.
+    # (0.1.0 accepted [close, verify], i.e. a verify written AFTER the close; see R4.)
+    open_ok = _ev("task.open", t0, {"goal": "g", "dod": ["file_exists:x"], "dod_hash": "h1"}, task="T")
     close_ok = _ev("task.close", t0, {"outcome": "verified", "dod": ["file_exists:x"], "dod_hash": "h1"}, task="T")
     ver_ok = _ev("verify", t0, {"predicate": "file_exists:x", "ok": True, "evidence": "e", "dod_hash": "h1"}, task="T")
     ver_bad = _ev("verify", t0, {"predicate": "file_exists:x", "ok": True, "evidence": "e", "dod_hash": "OTHER"}, task="T")
-    add("V2 verified with matching verify", vitals.compute([close_ok, ver_ok])["vitals"]["V2_verified_done"]["value"] == 1.0)
+    add("V2 verified with matching verify", vitals.compute([open_ok, ver_ok, close_ok])["vitals"]["V2_verified_done"]["value"] == 1.0)
     add("V2 verified without verify not counted", vitals.compute([close_ok])["vitals"]["V2_verified_done"]["extra"]["unproven_verified"] == 1
         and vitals.compute([close_ok])["vitals"]["V2_verified_done"]["value"] == 0.0)
-    add("V2 verify with other hash not counted", vitals.compute([close_ok, ver_bad])["vitals"]["V2_verified_done"]["value"] == 0.0)
+    add("V2 verify with other hash not counted", vitals.compute([open_ok, ver_bad, close_ok])["vitals"]["V2_verified_done"]["value"] == 0.0)
 
     # --- V1: a cli verdict does not count, tg does
     v_cli = _ev("owner.verdict", t0, {"artifact": "a", "verdict": "accept", "reasons": []}, src="cli")
@@ -177,7 +411,7 @@ def run() -> int:
 
     # --- balance
     add("balance empty -> NO DATA", empty["balance"]["value"] is None)
-    bal_ev = [v_tg, close_ok, ver_ok,
+    bal_ev = [v_tg, open_ok, ver_ok, close_ok,
               _ev("incident", t0, {"cls": "STALL", "severity": "high", "repeat": True, "detail": {"minutes": 40.0}}),
               _ev("incident", t0, {"cls": "BLIND_EDIT", "severity": "medium", "repeat": False, "detail": {"path": "x"}}),
               _ev("incident", t0, {"cls": "LOOP", "severity": "medium", "repeat": True, "detail": {}})]
@@ -187,7 +421,7 @@ def run() -> int:
         led = Ledger(Path(td) / "l.jsonl")
         f = Path(td) / "out.txt"
         # --- contract: verified without verify is refused; after verify it passes; reopening is refused
-        contract.open_task(led, session="s", project="p", task="T1", goal="make a file", dod=[f"file_min_bytes:{f}:5"], forecast_p=0.8)
+        contract.open_task(led, session="s", project="p", task="T1", goal="make a file", dod=[f"file_min_bytes:{f}:5"], forecast_p=0.8, root=td)
         try:
             contract.open_task(led, session="s", project="p", task="T1", goal="swap", dod=["cmd_exit0:echo ok"])
             add("reopen refused", False)
@@ -214,14 +448,15 @@ def run() -> int:
         res = contract.verify(led, task="T1", cwd=Path(td), session="s", project="p")
         add("verify ok", all(e["data"]["ok"] for e in res))
         e = contract.close_task(led, task="T1", outcome="verified", session="s", project="p")
-        add("close verified after verify", e["data"]["outcome"] == "verified" and e["data"]["dod_hash"] == contract.dod_hash([f"file_min_bytes:{f}:5"]))
+        add("close verified after verify", e["data"]["outcome"] == "verified"
+            and e["data"]["dod_hash"] == contract.dod_hash([f"file_min_bytes:{f}:5"], str(Path(td).resolve())))
         try:
             contract.close_task(led, task="T1", outcome="claimed", session="s", project="p")
             add("double close refused", False)
         except contract.ContractError:
             add("double close refused", True)
         # manual predicate: closed only by --ok with evidence
-        contract.open_task(led, session="s", project="p", task="T2", goal="manual", dod=["manual:owner listened"])
+        contract.open_task(led, session="s", project="p", task="T2", goal="manual", dod=["manual:owner listened"], root=td)
         try:
             contract.verify(led, task="T2", cwd=Path(td), session="s", project="p", manual_ok={"manual:owner listened": "  "})
             add("manual without evidence refused", False)
@@ -316,6 +551,7 @@ def run() -> int:
         cls = {i["data"]["cls"] for i in found}
         add("backfill incidents UNVERIFIED_CLAIM+REPEAT_ORDER+FANOUT", {"UNVERIFIED_CLAIM", "REPEAT_ORDER", "FANOUT"} <= cls, str(cls))
         add("backfill no owner text stored", not any("sales" in json.dumps(e, ensure_ascii=False) for e in ev))
+        add("R8 backfill keeps the tool_use_id", any(e["data"].get("tool_use_id") == "tu1" for e in ev if e["ev"] == "tool.call"))
 
     # ---- cheap primitives and an honest V13 (both ends) --------------------------
     import hashlib as _hl
@@ -439,6 +675,8 @@ def run() -> int:
     n2 = _ev("usage", tb + timedelta(seconds=30), u_data)
     rn = vitals.compute([_ev("session.start", tb, {"memory_attached": True}), n1, n2])["vitals"]["V4_tokens_per_hour"]["extra"]
     add("usage without a request id cannot be de-duplicated and is all counted", rn["total"] == 30 and rn["usage_duplicates_dropped"] == 0)
+
+    _review_regressions(add, t0)
 
     passed = sum(1 for _, ok, _ in checks if ok)
     for name, ok, detail in checks:

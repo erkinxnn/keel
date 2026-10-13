@@ -14,8 +14,16 @@ Two properties without which the ledger is not evidence:
       calls of one message; without the lock 22 % of events were lost in testing;
     * events are chained by hashes: `prev` = the first 16 hex chars of the previous event's hash,
       `h` = sha256 of (the full previous hash + the canonical event record without h). `audit()`
-      finds any insertion, deletion or edit of a line. There is no signature: the chain catches
-      an edit, not an author.
+      detects an edited line and a line inserted, deleted or moved INSIDE the chain.
+
+What the chain does NOT detect on its own: lines cut off the END of the file (the remaining
+prefix is still a valid chain), and a file deleted or rebuilt from scratch. For those keep an
+external checkpoint (`events` and `last_hash` printed by `python -m keel audit`) somewhere the
+agent cannot write, and pass it back with `--expect-count` / `--expect-last-hash`. There is no
+signature: the chain catches an edit, not an author.
+
+The ledger is append-only by convention, not by the file system: any process that can write the
+file can append to it or rewrite it.
 """
 from __future__ import annotations
 
@@ -101,27 +109,35 @@ class Ledger:
         return _FileLock(self.path + ".lock")
 
     def _last_hash(self) -> str:
-        """Full hash of the last event (the file tail is read); empty for a new ledger."""
+        """Full hash of the last event; empty for a new ledger. The tail is read backwards in
+        growing chunks until a complete line is found, so a record longer than the first chunk
+        (64 KiB) does not restart the chain."""
         try:
-            if os.path.getsize(self.path) == 0:
-                return ""
+            size = os.path.getsize(self.path)
         except OSError:
             return ""
+        if size == 0:
+            return ""
+        chunk = 65536
         with open(self.path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            chunk = min(size, 65536)
-            fh.seek(size - chunk)
-            tail = fh.read(chunk)
-        lines = [ln for ln in tail.split(b"\n") if ln.strip()]
-        for ln in reversed(lines):
-            try:
-                e = json.loads(ln.decode("utf-8", "replace"))
-                if isinstance(e, dict) and e.get("h"):
-                    return str(e["h"])
-            except json.JSONDecodeError:
-                continue
-        return ""
+            while True:
+                chunk = min(chunk, size)
+                fh.seek(size - chunk)
+                pieces = fh.read(chunk).split(b"\n")
+                if chunk < size:
+                    pieces = pieces[1:]  # the first piece may be the end of a longer line
+                for ln in reversed(pieces):
+                    if not ln.strip():
+                        continue
+                    try:
+                        e = json.loads(ln.decode("utf-8", "replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(e, dict) and e.get("h"):
+                        return str(e["h"])
+                if chunk >= size:
+                    return ""
+                chunk *= 4
 
     def _seal(self, event: dict[str, Any], prev_full: str) -> tuple[dict[str, Any], str]:
         schema.validate(event)
@@ -242,14 +258,23 @@ class Ledger:
         return list(seen)
 
     # ---- integrity ----------------------------------------------------------
-    def audit(self, *, max_breaks: int = 20) -> dict[str, Any]:
-        """Check the hash chain. Returns the number of events, breaks, and the first breaks
-        (line number and reason). An event without h (old-format ledger) counts as a break."""
+    def audit(self, *, max_breaks: int = 20, expect_count: int | None = None,
+              expect_last_hash: str | None = None) -> dict[str, Any]:
+        """Check the hash chain. Returns the number of events, breaks, the first breaks (line number
+        and reason) and `last_hash` (record it with `events` as an external checkpoint).
+
+        Detected: an edited line; a line inserted, deleted or moved inside the chain; a corrupt line;
+        a line without a hash (old format); a missing file. NOT detected without a checkpoint: lines
+        cut off the end, a file rebuilt from scratch. With `expect_count` (and optionally
+        `expect_last_hash`, the full hash or a prefix of at least 16 chars) a shorter file, or a
+        chain whose hash at that position differs, is a break."""
         total = 0
         breaks: list[dict[str, Any]] = []
         prev_full = ""
+        hash_at_expected: str | None = None
         if not os.path.exists(self.path):
-            return {"events": 0, "breaks": 0, "ok": True, "details": []}
+            return {"events": 0, "breaks": 1, "ok": False, "missing": True, "last_hash": "",
+                    "details": [{"line": 0, "why": "ledger file is missing"}]}
         with open(self.path, "r", encoding="utf-8", errors="replace") as fh:
             for ln, line in enumerate(fh, 1):
                 line = line.strip()
@@ -261,8 +286,11 @@ class Ledger:
                 except json.JSONDecodeError:
                     breaks.append({"line": ln, "why": "corrupt line"})
                     continue
+                if not isinstance(e, dict):
+                    breaks.append({"line": ln, "why": "corrupt line: not a JSON object"})
+                    continue
                 h = e.get("h")
-                if not h:
+                if not h or not isinstance(h, str):
                     breaks.append({"line": ln, "why": "no hash"})
                     prev_full = ""
                     continue
@@ -272,9 +300,54 @@ class Ledger:
                 if expected != h:
                     breaks.append({"line": ln, "why": "hash mismatch: line was edited"})
                 prev_full = h
+                if expect_count is not None and total == expect_count:
+                    hash_at_expected = h
                 if len(breaks) > max_breaks:
                     break
-        return {"events": total, "breaks": len(breaks), "ok": not breaks, "details": breaks[:max_breaks]}
+        if expect_count is not None and total < expect_count:
+            breaks.append({"line": 0, "why": f"tail truncated or file replaced: {total} events, the checkpoint says {expect_count}"})
+        if expect_last_hash:
+            target = hash_at_expected if expect_count is not None else prev_full
+            if len(expect_last_hash) < 16 or not (target or "").startswith(expect_last_hash):
+                breaks.append({"line": 0, "why": "checkpoint hash mismatch: the chain up to the checkpoint was cut or rebuilt"})
+        return {"events": total, "breaks": len(breaks), "ok": not breaks, "last_hash": prev_full,
+                "details": breaks[:max_breaks]}
+
+
+# Fields that can hold user text, paths, commands or command output, per event type.
+# Used by `redact_event` (python -m keel export). Numbers, booleans and hashes are kept.
+REDACT_FIELDS: dict[str, tuple[str, ...]] = {
+    "task.open": ("goal", "dod", "zone", "root"),
+    "task.close": ("goal", "dod", "evidence", "root"),
+    "verify": ("predicate", "evidence", "root"),
+    "owner.verdict": ("artifact", "reasons", "claimed_by"),
+    "incident": ("detail",),
+    "tool.call": ("path",),
+    "session.start": ("cwd", "transcript"),
+}
+
+
+def _mask(v: Any) -> str:
+    return "redacted:" + sha256_hex(json.dumps(v, ensure_ascii=False, sort_keys=True).encode("utf-8", "replace"))[:12]
+
+
+def redact_event(event: dict[str, Any]) -> dict[str, Any]:
+    """A copy of the event with text-bearing fields replaced by `redacted:<hash>` (equal inputs
+    give equal masks). Numbers and booleans inside an incident detail are kept. The copy keeps
+    the original `h`/`prev`, so a redacted export no longer passes `audit`."""
+    out = dict(event)
+    data = dict(event.get("data") or {}) if isinstance(event.get("data"), dict) else {}
+    for k in REDACT_FIELDS.get(str(event.get("ev")), ()):
+        v = data.get(k)
+        if v in (None, "", [], {}):
+            continue
+        if k == "detail" and isinstance(v, dict):
+            data[k] = {dk: (dv if dv is None or isinstance(dv, (bool, int, float)) else _mask(dv)) for dk, dv in v.items()}
+        else:
+            data[k] = _mask(v)
+    out["data"] = data
+    out["redacted"] = True
+    return out
 
 
 def window_since(days: float) -> "datetime":

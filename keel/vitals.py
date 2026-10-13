@@ -12,8 +12,13 @@ Statuses:
     REF       the band is reference only (a threshold with no measurement at both ends): it must
               not be painted red, it is printed with the value as "above/below the reference threshold"
 
-Design notes: V1 counts only trusted verdict sources; V2 re-checks `verified` against verify
-events carrying the contract hash; V8 counts distinct files; V9 is a union of intervals, one
+Design notes: V1 counts owner.verdict accepts whose source is not the CLI (tg, owner,
+owner-file); the CLI cannot write those sources, but the ledger is not authenticated, so V1 is a
+count of claimed accepts, not of signed ones. V2 replays the contracts in ledger order (shared with
+`keel.contract.close_task`): a close is proven only if its open exists and the latest verify of
+every predicate between the open and the close passed; for a time window the contract events from
+before the window are passed in `contract_events`. Tool calls observed twice (live hook and
+subagent transcript) are counted once by `tool_use_id`; V8 counts distinct files; V9 is a union of intervals, one
 incident per wait; V14 recognises a "coin flip" forecaster and prints the mean p; corrupted
 numbers do not crash the board, they are counted; unfinished calls are reported separately; the
 board's own cost is computed including the cost line.
@@ -39,7 +44,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from . import schema
-from .contract import TRUSTED_VERDICT_SRC
+from .contract import TRUSTED_VERDICT_SRC, replay
 
 # reference threshold for a full adapter call (interpreter + imports + work), ms.
 # Calibrated on one machine (base cost of an empty `python -S -E` process about 87 ms): the layer
@@ -54,7 +59,7 @@ BANDS: dict[str, dict[str, Any]] = json.loads((_HERE / "vitals_bands.json").read
 _i = schema.safe_int
 
 NAMES: dict[str, tuple[str, str]] = {
-    "V1_accepted": ("Accepted by owner", "count"),
+    "V1_accepted": ("Claimed owner accepts", "count"),
     "V2_verified_done": ("Proven done", "share"),
     "V3_evidence_ratio": ("Claims with evidence", "share"),
     "V4_tokens_per_hour": ("Token burn", "k/hour"),
@@ -153,22 +158,37 @@ def active_seconds(events: Iterable[dict[str, Any]], idle_gap_s: float = IDLE_GA
     return total
 
 
-def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    """events: the events of one window (already filtered by time and project)."""
+def _ekey(e: dict[str, Any]) -> Any:
+    return e.get("h") or id(e)
+
+
+def compute(events: Iterable[dict[str, Any]], contract_events: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """events: the events of one window (already filtered by time and project), in ledger order.
+    contract_events: task.open/verify/task.close events of the WHOLE ledger in ledger order, for a
+    window report (a close inside the window may belong to an open before it). None = use `events`."""
     ev = []
     bad_events = 0
+    seen_tu: set[tuple[str, str]] = set()
+    tool_dups = 0
     for e in events:
-        if not isinstance(e, dict) or not isinstance(e.get("data"), dict) or "ev" not in e:
+        if not isinstance(e, dict) or not isinstance(e.get("data"), dict) or "ev" not in e \
+                or "session" not in e or "ts" not in e:
             bad_events += 1
             continue
+        if e["ev"] == "tool.call" and e["data"].get("tool_use_id"):
+            k = (str(e["session"]), str(e["data"]["tool_use_id"]))
+            if k in seen_tu:
+                tool_dups += 1
+                continue
+            seen_tu.add(k)
         ev.append(e)
     by: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for e in ev:
         by[e["ev"]].append(e)
 
     sessions = {e["session"] for e in ev}
-    head_sessions = {e["session"] for e in by["session.start"] if e["agent"] == "head"}
-    durations = [float(_i(e["data"].get("duration_s"))) for e in by["session.stop"] if e["agent"] == "head"]
+    head_sessions = {e["session"] for e in by["session.start"] if e.get("agent", "head") == "head"}
+    durations = [float(_i(e["data"].get("duration_s"))) for e in by["session.stop"] if e.get("agent", "head") == "head"]
     wall_clock_hours = sum(durations) / 3600.0   # old time base, kept for transparency only
     active_s = active_seconds(ev)
     hours = active_s / 3600.0                      # the time base of V4
@@ -198,7 +218,7 @@ def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
         tok["calls"] += 1
         per_session_tokens[e["session"]] += total
         ctx.append(float(_i(d.get("cache_read")) + _i(d.get("input"))))
-        if e["agent"] != "head":
+        if e.get("agent", "head") != "head":
             tok_sub += total
 
     # ---- tools
@@ -207,7 +227,8 @@ def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     unfinished = len(calls) - len(finished)
     n_calls = len(finished)
     ok_true = sum(1 for c in finished if c["data"].get("ok") is True)
-    ok_false = sum(1 for c in finished if c["data"].get("ok") is False)
+    interrupted = sum(1 for c in finished if c["data"].get("ok") is False and c["data"].get("interrupted"))
+    ok_false = sum(1 for c in finished if c["data"].get("ok") is False and not c["data"].get("interrupted"))
     out_total = sum(_i(c["data"].get("out_bytes")) for c in finished)
     out_flood = sum(_i(c["data"].get("out_bytes")) for c in finished if _i(c["data"].get("out_bytes")) > 20000)
     n_flood = sum(1 for c in finished if _i(c["data"].get("out_bytes")) > 20000)
@@ -243,23 +264,22 @@ def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     claims_with_ev = sum(1 for c in claims_done if _i(c["data"].get("evidence_n")) > 0)
     negated = sum(_i(c["data"].get("negated_n")) for c in by["claim"])
 
-    # ---- contracts: verified only when matched by verify events with the contract hash
-    closes = by["task.close"]
-    verify_ok: dict[tuple[str, str], set[str]] = defaultdict(set)  # (task, hash) -> predicates with ok
-    for v in by["verify"]:
-        if v["data"].get("ok") is True and v.get("task") is not None:
-            verify_ok[(str(v["task"]), str(v["data"].get("dod_hash")))].add(str(v["data"].get("predicate")))
+    # ---- contracts: replayed in ledger order, the same logic as contract.close_task
+    closes = [c for c in by["task.close"] if c.get("task") is not None]
+    if contract_events is None:
+        replayed = replay(ev)[0]
+    else:
+        window_keys = {_ekey(c) for c in closes}
+        replayed = [r for r in replay(contract_events)[0] if _ekey(r[0]) in window_keys]
     verified = 0
     unproven_verified = 0
     briers: list[float] = []
     ps: list[float] = []
-    for c in closes:
+    for c, _opened, proven in replayed:
         d = c["data"]
         is_ver = False
         if d.get("outcome") == "verified":
-            dod = d.get("dod") or []
-            proven = verify_ok.get((str(c.get("task")), str(d.get("dod_hash"))), set())
-            if dod and all(p in proven for p in dod):
+            if proven:
                 is_ver = True
                 verified += 1
             else:
@@ -303,8 +323,9 @@ def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     vit: dict[str, Any] = {}
     vit["V1_accepted"] = _v(
         "V1_accepted", float(accepted) if trusted else None, len(trusted),
-        note=("" if trusted else ("verdicts exist only from an untrusted source (cli), they do not count"
-                                  if verdicts else "no owner.verdict at all: set up an owner verdict channel (tg/owner)")),
+        note=("claimed: written by an owner-side integration through keel.contract.record_verdict; the CLI cannot write it, the ledger does not authenticate it"
+              if trusted else ("verdicts exist only from the CLI (src=cli), they do not count"
+                               if verdicts else "no owner.verdict from an owner-side integration (KEEL ships none)")),
         extra={"rejected": len(trusted) - accepted, "untrusted_accepts": untrusted_acc, "untrusted_rejects": untrusted_rej},
     )
     vit["V2_verified_done"] = _v(
@@ -339,7 +360,9 @@ def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     )
     vit["V6_tool_error_rate"] = _v(
         "V6_tool_error_rate", (ok_false / (ok_true + ok_false)) if (ok_true + ok_false) else None, ok_true + ok_false,
-        extra={"errors": ok_false, "calls": len(calls), "unfinished": unfinished, "tool_mix": dict(tool_mix.most_common(8))},
+        note="live failures need the PostToolUseFailure adapter; user interrupts are not errors",
+        extra={"errors": ok_false, "interrupted": interrupted, "calls": len(calls), "unfinished": unfinished,
+               "duplicates_dropped": tool_dups, "tool_mix": dict(tool_mix.most_common(8))},
     )
     vit["V7_loops_per_100"] = _v(
         "V7_loops_per_100", (cls_count["LOOP"] / n_calls * 100.0) if n_calls else None, n_calls,
@@ -374,7 +397,7 @@ def compute(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     wall_ms = round(_median(wall_per_call)) if wall_per_call else None
     vit["V13_layer_tax_ms"] = _v(
         "V13_layer_tax_ms", _median(layer_ms) if layer_ms else None, len(layer_ms),
-        note=(("internal adapter time; full call " + str(wall_ms) + " ms (interpreter start and imports, from a benchmark run)")
+        note=(("internal adapter time up to the ledger write (lock, write, fsync not included); full call " + str(wall_ms) + " ms (interpreter start and imports, from a benchmark run)")
               if (layer_ms and wall_ms is not None) else
               ("internal adapter time; the full call was not benchmarked (no layer.cost events with kind=wall)" if layer_ms
                else "the layer has not run live yet: layer.cost is written by the hooks")),
