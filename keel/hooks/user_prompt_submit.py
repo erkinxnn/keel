@@ -3,6 +3,8 @@
 
 The words of the message are kept ONLY as a set of words in the project state
 `<keel dir>/state/prompts.jsonl` for the Jaccard comparison; the text does not go into the ledger.
+Every write rewrites that file under a lock without the entries older than DAYS (14) days, so a
+word set is deleted at the first prompt after it expires (it stays longer only if no prompt comes).
 Harness plumbing (summaries after compaction, interruptions) does not count as a human message.
 Resets the turn's Stop-block counter.
 Input: {"session_id","cwd","hook_event_name":"UserPromptSubmit","prompt"}
@@ -19,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import emit, keel_dir, known_classes, ledger_for, locked_state, project_name, remember_classes, run_hook, schema  # noqa: E402
 
 from keel import incidents  # noqa: E402
+from keel.ledger import _FileLock  # noqa: E402
 from keel._fast import sha256_hex  # noqa: E402
 from keel.extract import is_human_prompt  # noqa: E402
 
@@ -42,30 +45,36 @@ def main(inp):
     hist_path = os.path.join(hist_dir, "prompts.jsonl")
     now = time.time()
     repeat_of = None
-    if len(words) >= MIN_WORDS and os.path.exists(hist_path):
-        ws = set(words)
-        with open(hist_path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                try:
-                    o = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if now - float(o.get("t", 0)) > DAYS * 86400:
-                    continue
-                if o.get("h") == h:
-                    repeat_of = o["h"]
-                    break
-                pw = set(o.get("w", []))
-                u = len(ws | pw)
-                if u and len(ws & pw) / u >= JACC:
-                    repeat_of = o["h"]
-                    break
-    line = (json.dumps({"t": now, "h": h, "w": words, "s": session}, ensure_ascii=False) + "\n").encode("utf-8")
-    fd = os.open(hist_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
-    try:
-        os.write(fd, line)
-    finally:
-        os.close(fd)
+    ws = set(words)
+    kept: list[str] = []
+    with _FileLock(hist_path + ".lock"):
+        try:
+            with open(hist_path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(o, dict) or now - schema.safe_float(o.get("t")) > DAYS * 86400:
+                continue  # older than DAYS: deleted from the file, not only skipped
+            kept.append(line)
+            if repeat_of is not None or len(words) < MIN_WORDS:
+                continue
+            if o.get("h") == h:
+                repeat_of = o["h"]
+                continue
+            pw = set(o.get("w") or [])
+            u = len(ws | pw)
+            if u and len(ws & pw) / u >= JACC:
+                repeat_of = o.get("h")
+        kept.append(json.dumps({"t": now, "h": h, "w": words, "s": session}, ensure_ascii=False))
+        tmp = f"{hist_path}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write("".join(x + chr(10) for x in kept))
+        os.replace(tmp, hist_path)
     with locked_state(cwd, session) as st:
         st["turn"] = int(st.get("turn") or 0) + 1
         st["stop_blocks_turn"] = 0

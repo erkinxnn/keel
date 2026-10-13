@@ -41,7 +41,7 @@ def call(hook: str, payload: dict) -> int:
 
 def main() -> int:
     with tempfile.TemporaryDirectory() as td:
-        # the ledger and state live OUTSIDE the project: ~/.keel/<encoded cwd>/ (or KEEL_HOME);
+        # the ledger and state live OUTSIDE the project: ~/.keel/<slug>-<hash>/ (or KEEL_HOME);
         # the path is taken from the layer itself
         os.environ["KEEL_HOME"] = str(Path(td) / "keelhome")
         sys.path.insert(0, str(HOOKS))

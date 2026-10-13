@@ -109,19 +109,29 @@ unfinished calls are printed beside it (`unfinished_calls`). Limit: permission p
 transcript, so this is a lower bound.
 
 **V10 Subagent fan-out.** Question: how many model messages launched 4+ agents at once. Formula: the number
-of FANOUT incidents, where a fan-out is 4+ Agent calls with one `msg` (the requestId of the model message;
-in the live hook a 15-second window). Band: norm 0 without a stated reason. Inflate: launch three at a
-time. Defence: the total number of Agent calls and their token share are printed beside it.
+of FANOUT incidents, where a fan-out is 4+ Agent calls with one `msg`. In backfill `msg` is the requestId of
+the model message. The live hook input carries no message id, so live `msg` is a burst: Agent calls of one
+agent in one turn, each completed within 15 s of the previous one (a gap rule, not a fixed clock bucket).
+Two messages less than 15 s apart are merged; Agent calls of one message that complete more than 15 s apart
+are split. Band: norm 0 without a stated reason. Inflate: launch three at a time. Defence: the total number
+of Agent calls and their token share are printed beside it.
 
-**V13 Layer tax.** Question: what does the control itself cost. Formula: the median ms of `layer.cost` per
-call; beside it the bytes injected into the context. Band: reference 500 ms. Inflate: not writing
-layer.cost. Defence: the `run_hook` wrapper writes it, not the adapter body. Limit: only the INTERNAL time is
-seen; the interpreter start (hundreds of ms on some machines) is not, `python -m keel doctor` measures it.
+**V13 Layer tax.** Question: what does the control itself cost. Formula: the median `ms` of `layer.cost`
+events; beside it the bytes injected into the context. What is timed: from the start of the `run_hook`
+wrapper (the interpreter has started and the adapter modules are imported) until the events of the call are
+handed to the ledger write. Not timed: interpreter start, imports, the ledger lock, write and fsync, the
+save of the session state file, process exit. Band: reference threshold 50 ms (status reference: shown as
+REF, it does not paint the vital red; one machine measured 25-47 ms, the detectors are 0.03 ms of it). Inflate: not writing layer.cost. Defence: the `run_hook` wrapper
+writes it, not the adapter body. Limit: the full wall-clock cost of a hook call is not in V13 (on the test
+machine an empty `python -S -E` process is 70-90 ms and a whole adapter call 200-350 ms);
+`tests/hooks_e2e.py` and `python -m keel doctor` measure it.
 
 ### Reliability
 
-**V6 Tool errors.** Formula: results with an error flag / all results. Band: none, baseline. Live limit:
-see ARCHITECTURE section 8 (`PostToolUseFailure` has no adapter yet).
+**V6 Tool errors.** Formula: results with an error flag / all finished results. Band: none, baseline.
+Live: failed calls come from the `PostToolUseFailure` adapter; calls the user interrupted (`interrupted`)
+are counted beside it and are not errors. Rows with the same `tool_use_id` are counted once, a finished row
+preferred over an unfinished one.
 
 **V7 Retry loops.** Formula: LOOP incidents (one signature 3+ times with a failure, or 4+ times clean, in a
 window of 10) per 100 calls.

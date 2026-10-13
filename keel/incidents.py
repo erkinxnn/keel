@@ -107,8 +107,8 @@ def detect_loops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if e["ev"] != "tool.call":
             continue
         sig = str(e["data"].get("sig") or "")
-        if not sig:
-            continue
+        if not sig or e["data"].get("interrupted"):
+            continue  # a call the user interrupted is not a retry
         failed = e["data"].get("ok") is False
         window.append((sig, failed))
         same = [f for s, f in window if s == sig]
@@ -121,9 +121,11 @@ def detect_loops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def detect_blind_edits(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """An Edit of a file that the SAME context (session, agent) did not read or write before: a read
+    by one subagent does not cover an edit by another one or by the head."""
     out: list[dict[str, Any]] = []
-    read_paths: set[str] = set()
-    written: set[str] = set()
+    reads_of: dict[tuple[str, str], set[str]] = {}
+    written_of: dict[tuple[str, str], set[str]] = {}
     for e in events:
         if e["ev"] != "tool.call":
             continue
@@ -131,6 +133,9 @@ def detect_blind_edits(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         path = e["data"].get("path")
         if not path:
             continue
+        ctx = (str(e.get("session")), str(e.get("agent") or "head"))
+        read_paths = reads_of.setdefault(ctx, set())
+        written = written_of.setdefault(ctx, set())
         p = norm_path(path)
         if tool in ("Read", "NotebookRead"):
             ob = e["data"].get("out_bytes")
@@ -179,8 +184,8 @@ def detect_error_bursts(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
     streak = 0
     for e in events:
-        if e["ev"] != "tool.call":
-            continue
+        if e["ev"] != "tool.call" or e["data"].get("interrupted"):
+            continue  # a user interrupt neither counts as an error nor breaks a streak
         if e["data"].get("ok") is False:
             streak += 1
             if streak == ERROR_BURST:
@@ -192,7 +197,8 @@ def detect_error_bursts(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def detect_fanout(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fan-out: >= FANOUT_MIN Agent calls in ONE model message (field msg; in history it is the
-    requestId, in the live hook a 15-second window)."""
+    requestId; in the live hook a burst of Agent calls of one agent in one turn, each within 15 s of
+    the previous one, because the hook input has no message id)."""
     out = []
     by_msg: dict[Any, list[dict[str, Any]]] = {}
     for e in events:

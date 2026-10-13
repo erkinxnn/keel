@@ -2,7 +2,7 @@
 """Event ledger: append-only, one JSON line per event, never rewritten.
 
 Default location: `<project_root>/.keel/ledger.jsonl`. The hook adapters write to
-`~/.keel/<encoded launch dir>/ledger.jsonl` instead (outside the repository). Ledgers built
+`~/.keel/<slug>-<hash>/ledger.jsonl` instead (outside the repository). Ledgers built
 from history (backfill) are separate files, `data/ledger/<project>.jsonl` by default.
 
 Why a file and not a database: a file survives any session, can be read from any language, can
@@ -149,20 +149,20 @@ class Ledger:
         return e, h
 
     # ---- writing ------------------------------------------------------------
+    def lock(self) -> _FileLock:
+        """The append lock. Hold it to make "read the ledger, check, append" one critical section,
+        and append with `append_locked` inside it (taking the lock twice would wait for itself)."""
+        return self._lock()
+
     def append(self, event: dict[str, Any]) -> dict[str, Any]:
         with self._lock():
-            prev = self._last_hash()
-            e, h = self._seal(event, prev)
-            line = (schema.dumps(e) + "\n").encode("utf-8")
-            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | _O_BINARY, 0o644)
-            try:
-                os.write(fd, line)
-                try:
-                    os.fsync(fd)
-                except OSError:
-                    pass
-            finally:
-                os.close(fd)
+            return self.append_locked(event)
+
+    def append_locked(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Append while the caller holds `lock()`."""
+        prev = self._last_hash()
+        e, h = self._seal(event, prev)
+        self._write_bytes((schema.dumps(e) + "\n").encode("utf-8"))
         event["h"] = h
         event["prev"] = e["prev"]
         return event

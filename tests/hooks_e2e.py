@@ -25,9 +25,10 @@ if hasattr(sys.stdout, "reconfigure"):
 from keel.ledger import Ledger  # noqa: E402
 
 sys.path.insert(0, str(HOOKS))
-from _common import encode_project_dir  # noqa: E402
+from _common import keel_dir  # noqa: E402
 
 KEEL_HOME = tempfile.mkdtemp(prefix="keel_home_")
+os.environ["KEEL_HOME"] = KEEL_HOME  # keel_dir() below resolves the same folder the adapters use
 
 
 def call(hook: str, payload: dict, env: dict | None = None) -> tuple[int, str, float]:
@@ -39,7 +40,7 @@ def call(hook: str, payload: dict, env: dict | None = None) -> tuple[int, str, f
 
 
 def led_of(cwd: str) -> Ledger:
-    return Ledger(Path(KEEL_HOME) / encode_project_dir(cwd) / "ledger.jsonl")
+    return Ledger(Path(keel_dir(cwd)) / "ledger.jsonl")
 
 
 def main() -> int:
@@ -99,7 +100,7 @@ def main() -> int:
         checks.append(("loop silent before 3rd", "LOOP" not in outs[0] and "LOOP" not in outs[1]))
         checks.append(("loop advised exactly on 3rd", "LOOP" in outs[2]))
         checks.append(("loop not repeated on 4th", "LOOP" not in outs[3]))
-        led = Ledger(Path(KEEL_HOME) / encode_project_dir(cwd) / "ledger.jsonl")
+        led = led_of(cwd)
         checks.append(("ledger lives outside the project", led.exists() and not (Path(cwd) / ".keel").exists()))
         incs = {e["data"]["cls"] for e in led.iter(ev="incident")}
         checks.append(("ledger has LOOP+BLIND_EDIT+ERROR_BURST", {"LOOP", "BLIND_EDIT", "TOOL_ERROR_BURST"} <= incs))
@@ -190,12 +191,12 @@ def main() -> int:
         rc, out, _ = call("post_tool_use.py", {**base, "agent_id": "B", "hook_event_name": "PostToolUse", "tool_name": "Edit", "tool_input": {"file_path": "C:/x/shared.py", "old_string": "a", "new_string": "b"}, "tool_response": {"ok": True}, "tool_use_id": "eb"})
         checks.append(("R12 edit by agent B after a read by agent A is a blind edit", "BLIND_EDIT" in out))
 
-        # R11: one message with six Agent calls gives at most one FANOUT incident
+        # R11: one message with six Agent calls gives exactly one FANOUT incident (zero is a failure too)
         before = sum(1 for e in led.iter(ev="incident") if e["data"]["cls"] == "FANOUT")
         for i in range(6):
             call("post_tool_use.py", {**base, "hook_event_name": "PostToolUse", "tool_name": "Agent", "tool_input": {"prompt": f"p{i}"}, "tool_response": "ok", "tool_use_id": f"ag{i}"})
         after = sum(1 for e in led.iter(ev="incident") if e["data"]["cls"] == "FANOUT")
-        checks.append(("R11 six Agent calls in one message: at most one FANOUT", after - before <= 1))
+        checks.append(("R11 six Agent calls in one message: exactly one FANOUT", after - before == 1))
         checks.append(("R14 MEMORY_LOST at session start is an incident", any(e["data"]["cls"] == "MEMORY_LOST" for e in led.iter(ev="incident"))))
 
         rc, out, ms = call("session_end.py", {**base, "hook_event_name": "SessionEnd", "reason": "exit"}); lat["session_end"] = ms

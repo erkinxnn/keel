@@ -23,8 +23,11 @@ not once per call.
 Events are queued and go into the ledger as ONE write (`flush`): one lock and one fsync per
 adapter call instead of two or three.
 
-Ledger location: the KEEL_LEDGER variable, otherwise `~/.keel/<encoded cwd>/ledger.jsonl`
-(`KEEL_HOME` overrides `~/.keel`).
+Ledger location: the KEEL_LEDGER variable, otherwise `~/.keel/<slug>-<hash>/ledger.jsonl`, where
+<slug> is the launch directory with every non-alphanumeric character turned into a dash (readable)
+and <hash> is 10 hex chars of the SHA-256 of the normalised absolute path (so `a_b` and `a-b` never
+share a folder). A folder written by 0.1.0/0.2.0 under the bare slug is still used when its
+project.json names the same directory. `KEEL_HOME` overrides `~/.keel`.
 """
 from __future__ import annotations
 
@@ -51,10 +54,12 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from keel import schema  # noqa: E402
+from keel._fast import sha256_hex  # noqa: E402
 from keel.ledger import Ledger, _FileLock  # noqa: E402
 
 _DIRS: dict[str, str] = {}
 _QUEUE: list[dict] = []
+_RUN: dict = {}  # the adapter call in progress: name, start time, session, cwd, whether layer.cost was queued
 
 
 def read_input() -> dict:
@@ -73,7 +78,7 @@ def keel_home() -> str:
 
 
 def keel_dir(cwd: str | None) -> str:
-    """The ledger and state live OUTSIDE the project repository: `~/.keel/<encoded cwd>/`
+    """The ledger and state live OUTSIDE the project repository: `~/.keel/<slug>-<hash>/`
     (the way Claude Code stores its own transcripts). Otherwise the ledger would land in git
     auto-sync and in the session's context. A project.json with the real directory path is
     written next to it. The directory is computed once per process: mkdir and stat on every
@@ -83,7 +88,12 @@ def keel_dir(cwd: str | None) -> str:
     if hit is not None:
         return hit
     base = os.path.abspath(cwd) if cwd else os.getcwd()
-    d = os.path.join(keel_home(), encode_project_dir(base))
+    home = keel_home()
+    d = os.path.join(home, project_dir_name(base))
+    if not os.path.isdir(d):
+        old = os.path.join(home, encode_project_dir(base))
+        if _owned_by(old, base):
+            d = old  # a folder written by 0.1.0/0.2.0 for this very directory
     os.makedirs(d, exist_ok=True)
     marker = os.path.join(d, "project.json")
     if not os.path.exists(marker):
@@ -94,6 +104,21 @@ def keel_dir(cwd: str | None) -> str:
             pass
     _DIRS[key] = d
     return d
+
+
+def project_dir_name(base: str) -> str:
+    """Folder name for a launch directory: readable slug + hash of the normalised absolute path."""
+    key = sha256_hex(os.path.normcase(os.path.abspath(base)).encode("utf-8", "surrogatepass"))[:10]
+    return f"{encode_project_dir(base)[-80:]}-{key}"
+
+
+def _owned_by(d: str, base: str) -> bool:
+    try:
+        with open(os.path.join(d, "project.json"), "r", encoding="utf-8") as fh:
+            owner = json.load(fh).get("cwd")
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(owner, str) and os.path.normcase(os.path.abspath(owner)) == os.path.normcase(base)
 
 
 def ledger_for(cwd: str | None) -> Ledger:
@@ -115,6 +140,24 @@ def flush(cwd: str | None) -> None:
     batch = list(_QUEUE)
     _QUEUE.clear()
     ledger_for(cwd).append_many(batch)
+
+
+def _cost_event(out: "dict | None", failed: bool) -> dict:
+    injected = len(json.dumps(out, ensure_ascii=False)) if out else 0
+    ms = int((time.perf_counter() - _RUN.get("t0", time.perf_counter())) * 1000)
+    return schema.make_event(
+        "layer.cost", session=str(_RUN.get("session") or "nosession"), project=project_name(_RUN.get("cwd")), src="hook",
+        data={"hook": _RUN.get("name") or "?", "ms": ms, "injected_bytes": injected, "failed": failed})
+
+
+def flush_call(cwd: str | None, out: "dict | None" = None) -> None:
+    """Write the queued events of this call NOW, together with its layer.cost (measured up to this
+    point), in one write. Raises if the write fails, so a caller marks something as written only
+    after this returns. run_hook then writes no second layer.cost."""
+    if _RUN and not _RUN.get("cost_done"):
+        _RUN["cost_done"] = True
+        emit(_cost_event(out, False))
+    flush(cwd)
 
 
 def project_name(cwd: str | None) -> str:
@@ -223,6 +266,8 @@ def run_hook(name: str, fn: "Callable[[dict], dict | None]") -> int:
     Never fails outwards; in strict mode only Stop may return a block.
     All events of the call (including layer.cost) go into the ledger as one write."""
     t0 = time.perf_counter()
+    _RUN.clear()
+    _RUN.update({"name": name, "t0": t0})
     inp: dict = {}
     cwd = None
     out: dict | None = None
@@ -230,17 +275,16 @@ def run_hook(name: str, fn: "Callable[[dict], dict | None]") -> int:
     try:
         inp = read_input()
         cwd = inp.get("cwd")
+        _RUN.update({"session": inp.get("session_id"), "cwd": cwd})
         out = fn(inp) or {}
     except Exception:  # noqa: BLE001
         import traceback
         failed = True
         log(cwd, f"{name}: ADAPTER ERROR (fail-open)\n{traceback.format_exc()}")
-    injected = len(json.dumps(out, ensure_ascii=False)) if out else 0
-    ms = int((time.perf_counter() - t0) * 1000)
     try:
-        emit(schema.make_event(
-            "layer.cost", session=str(inp.get("session_id") or "nosession"), project=project_name(cwd), src="hook",
-            data={"hook": name, "ms": ms, "injected_bytes": injected, "failed": failed}))
+        if not _RUN.get("cost_done"):
+            _RUN["cost_done"] = True
+            emit(_cost_event(out, failed))
         flush(cwd)
     except Exception as exc:  # noqa: BLE001
         log(cwd, f"{name}: events of the call were not written: {exc}")

@@ -45,7 +45,7 @@ an incident, shows a scoreboard.
 
 ## 3. Data flow of one turn
 
-The ledger and state of each project live outside the repository: `~/.keel/<encoded cwd>/`
+The ledger and state of each project live outside the repository: `~/.keel/<slug>-<hash of the absolute path>/`
 (`ledger.jsonl`, `state/`, `hooks.log`, `project.json`), so the ledger does not land in git
 auto-sync or in the session's context. `KEEL_HOME` overrides `~/.keel`, `KEEL_LEDGER` overrides the file.
 

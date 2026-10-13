@@ -168,7 +168,7 @@ def compute(events: Iterable[dict[str, Any]], contract_events: Iterable[dict[str
     window report (a close inside the window may belong to an open before it). None = use `events`."""
     ev = []
     bad_events = 0
-    seen_tu: set[tuple[str, str]] = set()
+    seen_tu: dict[tuple[str, str], int] = {}
     tool_dups = 0
     for e in events:
         if not isinstance(e, dict) or not isinstance(e.get("data"), dict) or "ev" not in e \
@@ -177,10 +177,15 @@ def compute(events: Iterable[dict[str, Any]], contract_events: Iterable[dict[str
             continue
         if e["ev"] == "tool.call" and e["data"].get("tool_use_id"):
             k = (str(e["session"]), str(e["data"]["tool_use_id"]))
-            if k in seen_tu:
+            j = seen_tu.get(k)
+            if j is not None:
                 tool_dups += 1
+                # a finished record (ok True/False) replaces an unfinished one (ok None) whole, so the
+                # result fields (ok, interrupted, out_bytes, ms) stay those of one record
+                if ev[j]["data"].get("ok") is None and e["data"].get("ok") is not None:
+                    ev[j] = e
                 continue
-            seen_tu.add(k)
+            seen_tu[k] = len(ev)
         ev.append(e)
     by: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for e in ev:
@@ -252,12 +257,13 @@ def compute(events: Iterable[dict[str, Any]], contract_events: Iterable[dict[str
         except Exception:  # noqa: BLE001
             bad_events += 1
             continue
-        minutes = float(i["data"].get("detail", {}).get("minutes") or 0)
+        det = i["data"].get("detail")
+        minutes = max(schema.safe_float(det.get("minutes")) if isinstance(det, dict) else 0.0, 0.0)
         stall_iv.append((start, start + minutes * 60.0))
         stall_keys.add((str(i["ts"])[:19], int(round(minutes))))
     stall_union_min = _union_minutes(stall_iv)
-    blind_files = {str(i["data"].get("detail", {}).get("path")).replace("\\", "/").lower()
-                   for i in incs if i["data"].get("cls") == "BLIND_EDIT"}
+    blind_files = {str(i["data"]["detail"].get("path")).replace("\\", "/").lower()
+                   for i in incs if i["data"].get("cls") == "BLIND_EDIT" and isinstance(i["data"].get("detail"), dict)}
 
     # ---- claims
     claims_done = [c for c in by["claim"] if c["data"].get("kind") in ("done", None)]

@@ -14,7 +14,9 @@ Protection against inflation, and where it stops:
     * `verify` runs the predicates in the pinned root (a different `cwd` is refused) and every
       verify event carries the `open_id` and `dod_hash` of the contract it checked;
     * `close --outcome verified` is accepted only if, replaying the ledger IN ORDER, the latest
-      verify of every predicate between this open and the close passed (`replay`). `keel.vitals`
+      verify of every predicate between this open and the close passed (`replay`); the check and
+      the close write happen under the ledger's append lock, so a concurrent verify cannot slip in
+      between them; a late close of an earlier open (another open_id) does not end the current one. `keel.vitals`
       uses the same replay for V2, so a verify written after the close, a failure after a pass,
       or a verify of an earlier run of the same task id does not count;
     * the ledger is hash-chained (`keel.ledger.audit`): an edited line inside the chain is visible;
@@ -81,6 +83,14 @@ def _matches(opened: dict[str, Any], e: dict[str, Any]) -> bool:
     return oid is None or d.get("open_id") == oid
 
 
+def _closes(opened: dict[str, Any], e: dict[str, Any]) -> bool:
+    """A task.close ends this open unless it names ANOTHER open: a late close of an earlier open
+    (its open_id differs) does not end the current one. A close without an open_id (0.1.0) does."""
+    oid = opened["data"].get("open_id")
+    cid = (e.get("data") or {}).get("open_id")
+    return oid is None or cid is None or cid == oid
+
+
 def replay(events: Iterable[dict[str, Any]]) -> tuple[list[tuple[dict[str, Any], dict[str, Any] | None, bool]], dict[str, dict[str, Any]]]:
     """Replay contract events in ledger order.
 
@@ -104,7 +114,11 @@ def replay(events: Iterable[dict[str, Any]]) -> tuple[list[tuple[dict[str, Any],
             if st is not None and _matches(st["open"], e):
                 st["last"][str(e["data"].get("predicate"))] = e["data"].get("ok") is True
         else:
-            st = current.pop(task, None)
+            st = current.get(task)
+            if st is not None and not _closes(st["open"], e):
+                closes.append((e, None, False))  # a stale close of an earlier open: the current open stays
+                continue
+            current.pop(task, None)
             proven = False
             if st is not None and e["data"].get("outcome") == "verified" and _matches(st["open"], e):
                 dod = st["open"]["data"].get("dod") or []
@@ -142,15 +156,16 @@ def open_task(
             raise ContractError(f"unknown predicate {p!r}; allowed: {', '.join(PREDICATES)}")
     if forecast_p is not None and not (0.0 <= forecast_p <= 1.0):
         raise ContractError("forecast_p must be in [0,1]")
-    if find_open(ledger, task) is not None:
-        raise ContractError(f"task {task!r} is already open: predicates do not change after opening; close it and open a new one with another id")
     root_abs = str(Path(root if root is not None else os.getcwd()).resolve())
     e = schema.make_event(
         "task.open", session=session, project=project, agent=agent, src=src, task=task,
         data={"goal": goal, "dod": list(dod), "dod_hash": dod_hash(dod, root_abs), "root": root_abs,
               "open_id": os.urandom(12).hex(), "budget": budget or {}, "forecast_p": forecast_p, "zone": zone or []},
     )
-    ledger.append(e)
+    with ledger.lock():  # check and write in one critical section: two opens cannot both pass the check
+        if find_open(ledger, task) is not None:
+            raise ContractError(f"task {task!r} is already open: predicates do not change after opening; close it and open a new one with another id")
+        ledger.append_locked(e)
     return e
 
 
@@ -286,18 +301,54 @@ def verify(ledger: Ledger, *, task: str, session: str, project: str, cwd: "str |
 
 
 def proven_predicates(ledger: Ledger, *, task: str, opened: dict[str, Any] | None = None) -> dict[str, bool]:
-    """The latest verify result of each predicate of the open contract (replayed in ledger order)."""
-    st = _state(ledger, task)
-    return dict(st["last"]) if st else {}
+    """The latest verify result of each predicate, replayed in ledger order.
+
+    opened=None: the contract open now. opened=<a task.open event of this task> (as returned by
+    open_task or find_open): that open, from its line up to the close that ended it, even after the
+    task was closed and opened again. An event that cannot be found in the ledger is refused."""
+    if opened is None:
+        st = _state(ledger, task)
+        return dict(st["last"]) if st else {}
+    if not isinstance(opened, dict) or opened.get("ev") != "task.open" or not isinstance(opened.get("data"), dict) \
+            or str(opened.get("task")) != str(task):
+        raise ContractError("opened must be a task.open event of this task, as returned by open_task or find_open")
+    oid, h = opened["data"].get("open_id"), opened.get("h")
+    if not oid and not h:
+        raise ContractError("opened has neither an open_id nor a ledger hash: it cannot be located in the ledger")
+    last: dict[str, bool] = {}
+    inside = False
+    for e in ledger.iter(where=lambda x: str(x.get("task")) == str(task)):
+        if not isinstance(e, dict) or not isinstance(e.get("data"), dict):
+            continue
+        if not inside:
+            inside = e.get("ev") == "task.open" and (e["data"].get("open_id") == oid if oid else e.get("h") == h)
+            continue
+        if e.get("ev") == "verify" and _matches(opened, e):
+            last[str(e["data"].get("predicate"))] = e["data"].get("ok") is True
+        elif e.get("ev") == "task.close" and _closes(opened, e):
+            break
+    if not inside:
+        raise ContractError("opened is not in this ledger")
+    return last
 
 
 def close_task(ledger: Ledger, *, task: str, outcome: str, session: str, project: str,
                evidence: list[str] | None = None, src: str = "cli") -> dict[str, Any]:
+    """Close the open contract. Reading the latest verify state and writing the close are ONE critical
+    section under the ledger's append lock: a verify that lands while the close is checked waits and
+    is written after the close, where the replay ignores it, so the close and V2 always agree."""
+    if outcome not in ("verified", "claimed", "blocked", "abandoned"):
+        raise ContractError("outcome: verified | claimed | blocked | abandoned")
+    with ledger.lock():
+        return _close_locked(ledger, task=task, outcome=outcome, session=session, project=project,
+                             evidence=evidence, src=src)
+
+
+def _close_locked(ledger: Ledger, *, task: str, outcome: str, session: str, project: str,
+                  evidence: list[str] | None, src: str) -> dict[str, Any]:
     st = _state(ledger, task)
     if st is None:
         raise ContractError(f"task {task!r} is not open or is already closed")
-    if outcome not in ("verified", "claimed", "blocked", "abandoned"):
-        raise ContractError("outcome: verified | claimed | blocked | abandoned")
     opened = st["open"]
     h = _open_hash(opened)
     if outcome == "verified":
@@ -309,7 +360,7 @@ def close_task(ledger: Ledger, *, task: str, outcome: str, session: str, project
                           data={"outcome": outcome, "evidence": evidence or [], "forecast_p": opened["data"].get("forecast_p"),
                                 "goal": opened["data"].get("goal"), "dod": list(opened["data"]["dod"]), "dod_hash": h,
                                 "open_id": opened["data"].get("open_id"), "root": opened["data"].get("root")})
-    ledger.append(e)
+    ledger.append_locked(e)
     return e
 
 

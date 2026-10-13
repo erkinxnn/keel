@@ -76,7 +76,7 @@
   "V13_layer_tax_ms": {
    "direction": "lower",
    "warn_above": 50,
-   "source": "benchmark on one machine: the adapter's own work up to the ledger write is 25-47 ms (lock, write and fsync are not inside this number), of which detectors are 0.03 ms and the rest is locking and the ledger fsync. The full call is measured separately: a 250 ms median threshold on a machine whose empty `python -S -E` process costs 87 ms; a 100 ms target is unreachable because the interpreter costs 70 ms and `import json` another 40 ms. Two numbers instead of one.",
+   "source": "benchmark on one machine: the timed part of an adapter call (from the start of run_hook, after interpreter start and imports, until the events are handed to the ledger write; the ledger lock, write and fsync are NOT inside) is 25-47 ms, of which the detectors are 0.03 ms. The full call is measured separately (tests/hooks_e2e.py, python -m keel doctor): a 250 ms median threshold on a machine whose empty `python -S -E` process costs 87 ms; a 100 ms target is unreachable because the interpreter costs 70 ms and `import json` another 40 ms. Two numbers instead of one.",
    "status": "reference"
   },
   "V14_calibration_brier": {

@@ -18,7 +18,7 @@ ORDER = list(NAMES.keys())
 
 def fmt_value(v: dict[str, Any]) -> str:
     val = v["value"]
-    if val is None:
+    if val is None or v.get("status") == "NO DATA":
         return "NO DATA"
     unit = v["unit"]
     if unit.startswith("share"):

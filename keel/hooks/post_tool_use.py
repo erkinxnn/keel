@@ -16,8 +16,10 @@ field excludes permission prompts); otherwise the PreToolUse timestamp if that o
 is registered; otherwise the gap since the previous event of the session, marked `ms_approx`
 (it includes model thinking and other calls, good enough only for a stall over 30 minutes).
 
-State (reads for the blind-edit detector, the window of recent calls) is kept per agent:
-the head and each subagent have separate contexts.
+State (reads for the blind-edit detector, the window of recent calls, the fan-out cluster) is kept
+per agent: the head and each subagent have separate contexts. The tool.call is written to the ledger
+inside the state lock and only then its tool_use_id is marked as seen; a call whose id is already
+seen (imported by SubagentStop first) is not written a second time.
 """
 from __future__ import annotations
 
@@ -27,15 +29,50 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import agent_label, emit, known_classes, ledger_for, locked_state, project_name, remember_classes, run_hook, schema  # noqa: E402
+from _common import agent_label, emit, flush_call, known_classes, ledger_for, locked_state, project_name, remember_classes, run_hook, schema  # noqa: E402
 
 from keel import incidents  # noqa: E402
 from keel.extract import in_bytes, is_error, norm_path, tool_path, tool_result_len  # noqa: E402
 
 WINDOW = 12
-FANOUT_BUCKET_S = 15
+FANOUT_GAP_S = 15
 MAX_AGENTS = 40
 SEEN_TUID = 5000
+
+
+def _agent_state(st: dict, agent: str) -> dict:
+    """Per-agent state (reads, recent calls, fan-out cluster), most recently used last.
+
+    State written by 0.1.0 kept one `read_paths`/`recent` for the whole session: it is migrated on
+    first use; its reads stay valid for every agent of the session (`legacy_reads`), its recent
+    calls go to the head. The cap evicts the least recently used SUBAGENT; the head is never evicted."""
+    agents = st.setdefault("agents", {})
+    if "read_paths" in st or "recent" in st:
+        old_reads = st.pop("read_paths", None) or []
+        old_recent = st.pop("recent", None) or []
+        st["legacy_reads"] = [str(p) for p in old_reads][-500:]
+        head = agents.setdefault("head", {})
+        head["recent"] = (list(old_recent) + list(head.get("recent") or []))[-WINDOW:]
+    per = agents.pop(agent, None) or {}
+    agents[agent] = per
+    subs = [k for k in agents if k != "head"]
+    for old in subs[:max(len(subs) - (MAX_AGENTS - 1), 0)]:
+        agents.pop(old, None)
+    return per
+
+
+def _fanout_msg(per: dict, turn: int, now: float) -> str:
+    """Live stand-in for "one model message" (the hook input carries no message id): Agent calls of
+    one agent in one turn, each completed within FANOUT_GAP_S seconds of the previous one, share a
+    key. A gap rule, not a fixed clock bucket, so a burst is not split at a bucket boundary; calls of
+    two messages less than 15 s apart are merged."""
+    fan = per.get("fan") or {}
+    if fan.get("msg") and fan.get("turn") == turn and 0 <= now - float(fan.get("t") or 0) <= FANOUT_GAP_S:
+        msg = str(fan["msg"])
+    else:
+        msg = f"{turn}:{int(now)}"
+    per["fan"] = {"turn": turn, "t": now, "msg": msg}
+    return msg
 
 
 def record(inp: dict, ok: bool, out_bytes: int, extra: dict | None = None, event_name: str = "PostToolUse"):
@@ -50,19 +87,25 @@ def record(inp: dict, ok: bool, out_bytes: int, extra: dict | None = None, event
     led = ledger_for(cwd)
     project = project_name(cwd)
     fresh = []
+    out = None
     agent = agent_label(inp)
     with locked_state(cwd, session) as st:
         pend = st.setdefault("pending", {})
         call = pend.pop(key, None)
+        seen = st.setdefault("seen_tuid", [])
+        if tuid and str(tuid) in seen:
+            st["last_t"] = now
+            return None  # already in the ledger: SubagentStop imported it from the transcript first
         if call is None:
             prev_t = float(st.get("last_t") or now)
             call = {"t": prev_t, "tool": tool, "sig": sig, "path": tool_path(tin), "in_bytes": in_bytes(tin),
-                    "turn": int(st.get("turn") or 0),
-                    "msg": f"{int(st.get('turn') or 0)}:{int(now // FANOUT_BUCKET_S)}", "approx": True}
+                    "turn": int(st.get("turn") or 0), "approx": True}
         st["last_t"] = now
+        per = _agent_state(st, agent)
+        msg = _fanout_msg(per, int(call.get("turn") or 0), now) if tool == "Agent" else call.get("msg")
         dur = inp.get("duration_ms")
         data = {"tool": tool, "ok": ok, "in_bytes": call["in_bytes"], "out_bytes": out_bytes,
-                "sig": sig, "path": call.get("path"), "turn": call.get("turn"), "msg": call.get("msg")}
+                "sig": sig, "path": call.get("path"), "turn": call.get("turn"), "msg": msg}
         if isinstance(dur, (int, float)) and not isinstance(dur, bool) and dur >= 0:
             data["ms"] = int(dur)
             data["ms_source"] = "hook"
@@ -72,18 +115,10 @@ def record(inp: dict, ok: bool, out_bytes: int, extra: dict | None = None, event
                 data["ms_approx"] = True
         if tuid:
             data["tool_use_id"] = str(tuid)
-            seen = st.setdefault("seen_tuid", [])
-            seen.append(str(tuid))
-            del seen[:-SEEN_TUID]
         if extra:
             data.update(extra)
         ev = emit(schema.make_event("tool.call", session=session, project=project, agent=agent, src="hook", data=data))
 
-        agents = st.setdefault("agents", {})
-        per = agents.pop(agent, None) or {}
-        agents[agent] = per  # most recently used last
-        for old in list(agents)[:-MAX_AGENTS]:
-            agents.pop(old, None)
         # read and written paths for the blind-edit detector, per agent context
         reads = per.setdefault("read_paths", [])
         p = call.get("path")
@@ -103,7 +138,7 @@ def record(inp: dict, ok: bool, out_bytes: int, extra: dict | None = None, event
         del recent[:-WINDOW]
         synthetic = [{"ev": "tool.call", "ts": ev["ts"], "session": session, "project": project, "agent": agent,
                       "src": "hook", "data": {"tool": "Read", "path": rp, "sig": "", "ok": True, "out_bytes": incidents.MIN_READ_CHARS}}
-                     for rp in reads]
+                     for rp in list(st.get("legacy_reads") or []) + reads]
         found = []
         for det in (incidents.detect_loops, incidents.detect_floods, incidents.detect_stalls,
                     incidents.detect_error_bursts, incidents.detect_fanout):
@@ -123,16 +158,22 @@ def record(inp: dict, ok: bool, out_bytes: int, extra: dict | None = None, event
             fresh.append(f)
             hist.add(f["data"]["cls"])
         del said[:-300]
+        if fresh:
+            msgs = []
+            for f in fresh:
+                c = incidents.CLASSES[f["data"]["cls"]]
+                rep = " REPEAT of a known class." if f["data"]["repeat"] else ""
+                msgs.append(f"KEEL {f['data']['cls']} ({c['name']}): {json.dumps(f['data']['detail'], ensure_ascii=False)}.{rep}")
+            out = {"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": "\n".join(msgs)}}
+        # the tool.call is written BEFORE its id is marked as seen: if the write fails, the state is
+        # not saved (the exception leaves the with-block) and SubagentStop can still import the call
+        flush_call(cwd, out)
+        if tuid:
+            seen.append(str(tuid))
+            del seen[:-SEEN_TUID]
     if fresh:
         remember_classes(cwd, {f["data"]["cls"] for f in fresh})
-    if not fresh:
-        return None
-    msgs = []
-    for f in fresh:
-        c = incidents.CLASSES[f["data"]["cls"]]
-        rep = " REPEAT of a known class." if f["data"]["repeat"] else ""
-        msgs.append(f"KEEL {f['data']['cls']} ({c['name']}): {json.dumps(f['data']['detail'], ensure_ascii=False)}.{rep}")
-    return {"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": "\n".join(msgs)}}
+    return out
 
 
 def main(inp):

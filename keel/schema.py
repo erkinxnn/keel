@@ -145,16 +145,27 @@ def validate(e: dict[str, Any]) -> None:
         raise SchemaError("verify.ok must be a bool (a string such as \"false\" is not a result)")
 
 
+def safe_float(v: Any, default: float = 0.0) -> float:
+    """A finite number from an event field that may have been corrupted: string, None, inf, nan, a dict."""
+    if v is None or isinstance(v, bool):
+        return default
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if f != f or f in (float("inf"), float("-inf")):
+        return default
+    return f
+
+
 def safe_int(v: Any, default: int = 0) -> int:
-    """A number from an event field that may have been corrupted: string, float, None."""
+    """An integer from an event field that may have been corrupted: string, float, None, inf, nan."""
     if v is None or isinstance(v, bool):
         return default
     if isinstance(v, int):
         return v
-    try:
-        return int(float(v))
-    except (TypeError, ValueError):
-        return default
+    f = safe_float(v, float("nan"))
+    return default if f != f else int(f)
 
 
 def dumps(e: dict[str, Any]) -> str:

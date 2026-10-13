@@ -7,8 +7,11 @@
                                                           (any folder, subagents, headless runs)
     python tools/install_hooks.py --project <path> --remove   remove (or --global --remove)
 
-What is touched: only hook ENTRIES whose command runs one of this checkout's adapter scripts
-(the exact absolute paths of `keel/hooks/<adapter>.py`). Other entries, including entries that
+What is touched: only hook ENTRIES whose command RUNS one of this checkout's adapter scripts: the
+command is split into arguments (POSIX shell rules on Linux/macOS, double-quote grouping on Windows),
+the program must be a Python interpreter, and its script argument must be exactly one of the paths
+`keel/hooks/<adapter>.py` of this checkout (compared after abspath and normcase). A command that only
+mentions such a path (`echo <path>`, `python <path>.backup`) is not KEEL's and is left alone. Other entries, including entries that
 share a group with a KEEL adapter, are kept; a group is dropped only if it becomes empty.
 Registrations that point to ANOTHER copy of KEEL are not recognised and are left alone.
 Before any write a backup `settings.json.bak_keel_<date_time>` is made, and the new file is
@@ -29,6 +32,8 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -51,20 +56,81 @@ PLAN = [
 ADAPTERS = sorted({p[2] for p in PLAN} | {"pre_tool_use.py"})
 
 
-def _norm(s: str) -> str:
-    return os.path.normcase(s).replace("\\", "/")
+_PYTHON_EXE = re.compile(r"^(python|pythonw|py)([0-9][0-9.]*)?(\.exe)?$", re.IGNORECASE)
+_OPTS_WITH_ARG = ("-X", "-W", "--check-hash-based-pycs")
 
 
-def _adapter_paths() -> list[str]:
-    return [_norm(str(HOOKS / a)) for a in ADAPTERS]
+def _split_windows(cmd: str) -> list[str]:
+    """Whitespace-separated arguments; a double-quoted span belongs to one argument (quotes removed).
+    No escape characters: Windows paths keep their backslashes. Unbalanced quotes: no arguments."""
+    out: list[str] = []
+    cur: list[str] = []
+    quoted = started = False
+    for ch in cmd:
+        if ch == '"':
+            quoted, started = not quoted, True
+        elif ch.isspace() and not quoted:
+            if started:
+                out.append("".join(cur))
+                cur, started = [], False
+        else:
+            cur.append(ch)
+            started = True
+    if quoted:
+        return []
+    if started:
+        out.append("".join(cur))
+    return out
+
+
+def _split_command(cmd: str) -> list[str]:
+    if os.name == "nt":
+        return _split_windows(cmd)
+    try:
+        return shlex.split(cmd, posix=True)
+    except ValueError:
+        return []
+
+
+def _script_of(cmd: str) -> str | None:
+    """The script a hook command executes: `<python> [options] <script> ...`, else None."""
+    args = _split_command(cmd)
+    if len(args) < 2 or not _PYTHON_EXE.match(os.path.basename(args[0].replace("\\", "/"))):
+        return None
+    i = 1
+    while i < len(args):
+        a = args[i]
+        if a in ("-c", "-m", "-") or a.startswith(("-c", "-m")) and len(a) > 2 and not a.startswith("--"):
+            return None  # inline code or a module, not a script
+        if a in _OPTS_WITH_ARG:
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return a
+    return None
+
+
+def _key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _adapter_keys() -> dict[str, str]:
+    return {_key(str(HOOKS / a)): a for a in ADAPTERS}
+
+
+def _adapter_of(h: object) -> str | None:
+    """The adapter file name if the entry runs one of this checkout's adapter scripts, else None."""
+    if not isinstance(h, dict) or h.get("type", "command") != "command":
+        return None
+    script = _script_of(str(h.get("command") or ""))
+    return _adapter_keys().get(_key(script)) if script else None
 
 
 def _is_keel_hook(h: object) -> bool:
     """True only for a command entry that runs one of this checkout's adapter scripts."""
-    if not isinstance(h, dict) or h.get("type", "command") != "command":
-        return False
-    cmd = _norm(str(h.get("command") or ""))
-    return any(p in cmd for p in _adapter_paths())
+    return _adapter_of(h) is not None
 
 
 def _keel_entries(groups: list) -> list[dict]:
@@ -120,7 +186,7 @@ def check(path: Path) -> dict[str, int]:
     hooks = cfg.get("hooks", {})
     res = {}
     for ev, _m, script, *_r in PLAN:
-        res[ev] = sum(1 for h in _keel_entries(hooks.get(ev, [])) if _norm(str(HOOKS / script)) in _norm(str(h.get("command"))))
+        res[ev] = sum(1 for h in _keel_entries(hooks.get(ev, [])) if _adapter_of(h) == script)
     print(f"{path}:")
     for ev, n in res.items():
         print(f"  {ev:18s} {'registered' if n else 'no'}{' (duplicate x%d)' % n if n > 1 else ''}")

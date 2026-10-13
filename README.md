@@ -1,7 +1,8 @@
 # KEEL: local agent observability and verification records for Claude Code
 
 KEEL turns Claude Code hooks and transcripts into a local audit trail: one hash-chained JSONL ledger per
-project with tool calls, failed calls, token usage, completion claims, task checks and verdicts. It is a
+launch directory (its folder name carries a hash of the absolute path, so two directories never share a
+ledger) with tool calls, failed calls, token usage, completion claims, task checks and verdicts. It is a
 small agent observability layer that runs on your machine: it reports retry loops, large tool outputs,
 tool errors and "done" claims without evidence, and it records a task as `verified` only after the
 task's explicit predicates ran and passed.
@@ -19,8 +20,8 @@ V3 Claims with evidence: NO DATA [NO DATA] (no claim events)
 ...
 ```
 
-(Real output of `python -m keel panel` on the quick-start ledger below, trimmed. Where there is no data,
-KEEL prints `NO DATA`, never a zero.)
+(Real output of `python -m keel panel` on the quick-start ledger below, trimmed. Where a vital has no data,
+the value column says `NO DATA` instead of a number.)
 
 ## What it does
 
@@ -45,7 +46,11 @@ KEEL prints `NO DATA`, never a zero.)
   `cmd_exit0:pytest -q`, `manual:...`). Each open gets a unique `open_id` and pins the absolute project root;
   the contract hash covers the predicates and the root. `verify` runs the predicates in that root. `close
   --outcome verified` is refused unless, replaying the ledger in order, the latest verify of every predicate
-  of THIS open passed. The proven-done metric (V2) uses the same replay.
+  of THIS open passed. The check and the close are one critical section under the ledger's append lock: a
+  verify written by another KEEL process meanwhile lands after the close and does not count for it. (A
+  writer that bypasses KEEL and appends to the file directly is not serialized; the ledger is not
+  authenticated.) A late close of an earlier open of the same task does not end the current open. The
+  proven-done metric (V2) uses the same replay.
 - **"Done" without evidence is visible.** The Stop hook records completion words ("done", "fixed",
   "verified", ...) with the number of tool calls and successful results in that turn. A "done" with no
   successful tool result in the turn is an incident; with `KEEL_STRICT=1` the reply is blocked, at most
@@ -65,7 +70,7 @@ not recorded.
 | PreToolUse | `pre_tool_use.py` | no (optional) | nothing in the ledger; the call start time, for duration |
 | PostToolUse | `post_tool_use.py` | yes | `tool.call` (ok, duration, sizes, path, `tool_use_id`); loop, flood, stall, blind edit, error burst, fan-out |
 | PostToolUseFailure | `post_tool_use_failure.py` | yes | `tool.call` with `ok=false` (`interrupted` for user interrupts), error length only |
-| SubagentStop | `subagent_stop.py` | yes | subagent usage and tool calls not already recorded live (by `tool_use_id`) |
+| SubagentStop | `subagent_stop.py` | yes | subagent usage, and subagent tool calls whose `tool_use_id` was not already written by the live hooks (an id is marked only after its row is written; a live call arriving after the import is not written again; duplicates that still reach the ledger are counted once, a finished row preferred) |
 | Stop | `stop.py` | yes | `usage` of the turn, `claim`; `UNVERIFIED_CLAIM`, optional strict block |
 | SessionEnd | `session_end.py` | yes | `session.stop` |
 | anything else (permission requests, notifications, compaction, ...) | none | no | not recorded; a call blocked or denied before it ran is not a tool call |
@@ -79,10 +84,13 @@ not recorded.
   predicates (paths, regexes, **shell commands**), verify evidence (for `cmd_exit0` the **last 300 chars of
   stdout**, for `regex_in_file` up to 80 chars of the **matched text**), close evidence, verdict reasons.
 - **Session state** next to the ledger: `state/prompts.jsonl` keeps the **set of words of each prompt** for
-  14 days (repeat-order detection); `hooks.log` keeps adapter tracebacks.
+  repeat-order detection; entries older than 14 days are deleted when the next prompt is recorded (with no
+  new prompt they stay on disk until one comes). `hooks.log` keeps adapter tracebacks.
 
-Location: `~/.keel/<encoded launch directory>/` (override with `KEEL_HOME`, or `KEEL_LEDGER` for the ledger
-file), outside your repository. Before sharing a ledger:
+Location: `~/.keel/<slug>-<hash>/`, where `<slug>` is the launch directory with every non-alphanumeric
+character replaced by `-` and `<hash>` is 10 hex chars of the SHA-256 of its absolute path (a folder made by
+0.1.0/0.2.0 under the bare slug is still used if its `project.json` names the same directory). Override with
+`KEEL_HOME`, or `KEEL_LEDGER` for the ledger file. It is outside your repository. Before sharing a ledger:
 
 ```bash
 python -m keel export --ledger <ledger.jsonl> --out share.jsonl
@@ -102,7 +110,7 @@ cd keel
 python -m keel selftest
 ```
 
-Expected last line: `SELFTEST: PASS n/n` (154/154 at the time of writing).
+Expected last line: `SELFTEST: PASS n/n` (155/155 at the time of writing).
 
 Register the hooks for **one project** (recommended; a global registration affects every project):
 
@@ -114,9 +122,11 @@ python tools/install_hooks.py --check --project /path/to/your/project
 This writes `/path/to/your/project/.claude/settings.json` (after saving a `settings.json.bak_keel_*` backup,
 through a temporary file and a rename) with seven hooks: SessionStart, UserPromptSubmit, PostToolUse,
 PostToolUseFailure, SubagentStop, Stop, SessionEnd. Each command is the absolute path of the Python that
-ran the installer, with `-S -E` (no site-packages processing at start). Only entries whose command runs one
-of this checkout's adapter scripts are added or removed; other entries, including neighbours in the same
-group, are kept. To remove:
+ran the installer, with `-S -E` (no site-packages processing at start). Only entries whose command executes
+one of this checkout's adapter scripts are added or removed: the command is split into arguments, the
+program must be a Python interpreter and its script argument must be exactly that adapter path. A command
+that only mentions the path (`echo <path>`, `python <path>.backup`) is kept, and so are other entries,
+including neighbours in the same group. To remove:
 
 ```bash
 python tools/install_hooks.py --project /path/to/your/project --remove
@@ -126,7 +136,7 @@ python tools/install_hooks.py --project /path/to/your/project --remove
 `keel/hooks/settings.snippet.json`. Print your scoreboard once a session has run:
 
 ```bash
-python -m keel panel --ledger ~/.keel/<encoded launch directory>/ledger.jsonl --days 14
+python -m keel panel --ledger ~/.keel/<slug>-<hash>/ledger.jsonl --days 14
 ```
 
 ## Quick start (commands that were actually run)
@@ -200,9 +210,14 @@ checks behind them) and derives behavioural metrics from that ledger. The two to
   the open; `manual:` predicates are closed by a word plus evidence text.
 - **Strict Stop is a proxy.** It blocks a "done" with no successful tool result in the turn; it does not
   check that the result belongs to the claimed task (only a contract does).
-- **Incident de-duplication.** FLOOD is keyed per call and FANOUT per model message; the other classes are
-  reported once per (agent, class, detail), so an identical repeat is not reported again and is not counted
-  again as an incident.
+- **Incident de-duplication.** Incidents found by the live PostToolUse/PostToolUseFailure detectors are
+  reported once per (agent, class, key) within a session; the session state remembers the last 300 keys, so
+  a repeat after that can be reported again. The key is the call for FLOOD and the message for FANOUT (in
+  backfill the requestId; live there is no message id in the hook input, so Agent calls of one agent in one
+  turn, each within 15 s of the previous one, count as one message: two messages less than 15 s apart are
+  merged, one message whose Agent calls finish more than 15 s apart is split). `UNVERIFIED_CLAIM` (Stop),
+  `REPEAT_ORDER` (UserPromptSubmit) and `MEMORY_LOST` (SessionStart) are written every time their condition
+  holds. Interrupted calls do not count toward LOOP or TOOL_ERROR_BURST.
 - **Durations.** `duration_ms` is used when the hook sends it; otherwise the gap since the previous event is
   used and marked `ms_approx`. Live events carry the completion time, backfill the start time, so STALL
   intervals of the two are shifted. There is no explicit start/end pair.
@@ -211,13 +226,16 @@ checks behind them) and derives behavioural metrics from that ledger. The two to
   call on the test machine, of which about 20-40 ms is KEEL's own work.
 - **Bands and point counts are experimental.** Thresholds were set on one user's history; the "8 points for
   calibration" and "12 points for precision" rules have no published analysis behind them.
-- **Tested on Windows only** (Windows 11, Python 3.11). The `fcntl` locking path for Linux/macOS exists but
-  has not been exercised. A CI workflow for Windows, Linux and macOS is included
-  (`.github/workflows/checks.yml`); it had not run when this was written. The tests drive the adapters with synthetic payloads shaped after the Claude Code
+- **Developed and tested locally on Windows only** (Windows 11, Python 3.11). Linux and macOS (the `fcntl`
+  locking path) are exercised only by the CI workflow (`.github/workflows/checks.yml`, Windows, Linux and
+  macOS on Python 3.11 and 3.12); see its latest run on GitHub for the current status. The tests drive the adapters with synthetic payloads shaped after the Claude Code
   hooks reference, not with recorded payloads from a live session.
 - **Completion words are English only** (`keel/incidents.py`, `DONE_WORDS_RE`).
-- **Ledgers written by 0.1.0** have no `open_id`/root in contracts and no `tool_use_id` in tool calls; they
-  are read with the old rules (hash match only, no de-duplication). A setup installed with 0.1.0 has no
+- **Ledgers written by 0.1.0** have no `open_id`/root in contracts and no `tool_use_id` in tool calls. Their
+  contracts are replayed with the same in-order rules as new ones, matched by hash only (there is no
+  `open_id`): a failed verify after a passed one cancels it, so V2 of an old ledger can be lower than 0.1.0
+  reported. Their tool calls are not de-duplicated. Session state written by 0.1.0 is migrated on first
+  use (its reads count for every agent of the session). A setup installed with 0.1.0 has no
   PostToolUseFailure registration: re-run the installer.
 - Packaging metadata is in `pyproject.toml`, but the package is not on PyPI and `pip install` was not
   tested; run it from a clone.

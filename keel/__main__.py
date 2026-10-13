@@ -111,14 +111,36 @@ def cmd_audit(a: argparse.Namespace) -> int:
 def cmd_export(a: argparse.Namespace) -> int:
     from . import schema
     from .ledger import redact_event
-    if Path(a.out).resolve() == Path(a.ledger).resolve():
-        print("REFUSED: --out must be another file")
+    src, out = Path(a.ledger), Path(a.out)
+
+    def same_file() -> bool:
+        if out.resolve() == src.resolve():
+            return True
+        try:  # a hard link or another path to the same file: same device and inode
+            return out.exists() and os.path.samefile(src, out)
+        except OSError:
+            return False
+
+    if same_file():
+        print("REFUSED: --out is the ledger itself (the same path, or a link to the same file)")
         return 2
+    events = list(Ledger(a.ledger).iter())  # the whole input is read before anything is written
+    tmp = out.with_name(f".{out.name}.keel_tmp_{os.getpid()}")
     n = 0
-    with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
-        for e in Ledger(a.ledger).iter():
-            fh.write(schema.dumps(e if a.no_redact else redact_event(e)) + "\n")
-            n += 1
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            for e in events:
+                fh.write(schema.dumps(e if a.no_redact else redact_event(e)) + "\n")
+                n += 1
+            fh.flush()
+            os.fsync(fh.fileno())
+        if same_file():
+            print("REFUSED: --out became a link to the ledger during the export")
+            return 2
+        os.replace(tmp, out)  # replaces the directory entry: the file behind a link is never truncated
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     if a.no_redact:
         print(f"exported {n} events to {a.out} WITHOUT redaction: goal text, predicates, command output tails, "
               f"verdict reasons, incident details and paths are included")
